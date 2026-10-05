@@ -1,0 +1,2461 @@
+//@version=6
+// ─────────────────────────────────────────────────────────────────────────
+// Internal to External Liquidity Delivery
+//
+// Dealing range -> internal structural execution -> external liquidity
+// delivery. The CISD, the retracement band and the imbalance zones are the
+// internal execution structure; the opposing dealing-range extreme is the
+// external draw on liquidity.
+//
+// A standalone delivery companion to Session-Based Liquidity Reversals.
+// The two scripts are deliberately NOT merged: the reversal model arms on a
+// sweep of a pre-session pool, this one arms on the formation order of the
+// dealing range itself. Same structural machinery, opposite trigger.
+//
+// THE MODEL
+//   1. The dealing range is a user-defined window. Its high and low are the
+//      external liquidity; everything the model does between them is internal.
+//   2. Which extreme printed FIRST decides the direction:
+//        ORB low  first  ->  target the ORB high  (hunt a bullish CISD)
+//        ORB high first  ->  target the ORB low   (hunt a bearish CISD)
+//   3. A fib retracement is drawn across the range. The extreme that formed
+//      FIRST carries 1, the later extreme carries 0, so the ratios read from
+//      the target back into the origin and the 0.618-0.786 band is the
+//      retracement band scored as confluence.
+//   4. The CISD is hunted with the anchor sitting inside the range (or off
+//      the last pre-session swing, optionally).
+//   5. FVG and IFVG zones overlapping the range are tracked as confluence.
+//   6. The far end of the range is the target. Reaching it ends the session.
+//
+// FORKED FROM Session-Based Liquidity Reversals v62:
+//   lines 674-825  swing structure and block formation  (verbatim)
+//   lines 826-1018 confirmation                          (sweep arming removed,
+//                                                         OB/PB ladder removed)
+//   lines 1019-1180 live setup / retest                  (collapsed to one level)
+//   lines 387-433  range percentile filter               (single slot)
+// Diff against v62 before porting any fix from one to the other.
+//
+// STRUCTURAL DETECTION is unchanged from the reversal engine:
+//   run    = the opposing candles between a swing high and the swing low
+//   anchor = the last of those candles whose OPEN is inside the range
+//   level  = that candle's open
+//   confirm= a later close beyond the level, in the target direction
+// Pivots are 2/2. No ATR, no point thresholds, no leg windows.
+//
+// v2.8  port review from Session-Based Liquidity Reversals v7.10
+//   1. -1 now targets the cycle IN PROGRESS on a midnight-crossing range. The
+//      default range is 1800-0800, so -1 set at 03:00 was targeting tonight's
+//      18:00 open and leaving the range actually running to be discarded — the
+//      exact thing the control exists to prevent. A window that crosses midnight
+//      belongs to the day it STARTED (fLatestTarget).
+//   2. CME clock gets an on/off input, in the Market group at the end of the
+//      list. SBLR identifies clocked symbols by an explicit ticker list; this
+//      uses "not futures" instead, deliberately. An explicit list that misses a
+//      ticker fails SILENTLY — weekend sessions feed the statistics with nothing
+//      on screen to say so. Clocking every non-futures feed fails loudly, and a
+//      genuine 24/7 market is one unticked box away.
+//   3. Spread buffer REMOVED. SBLR carried one in v7.7-v7.8 and dropped it in
+//      v7.9: these venues trigger stops and targets on their own last traded
+//      price, which is what the perp's chart plots, so touch-based scoring
+//      already matches the account. Chart the perp itself, not NQ.
+//   Not ported, pending a decision — each conflicts with a verified level:
+//   first-candle-of-leg anchor (IELD v10 verified last-of-run against 07 Jul),
+//   strict swings (differs only on exact ties, but a tie can sit on a verified
+//   swing), and the two-close DR kill (IELD's stop is already that same level).
+//
+//   Settings pass: Market group moved to the TOP of the inputs; DR level labels
+//   default to "DR H" / "DR L"; fib retracement style defaults to Dotted; the
+//   zone colour swatches get their own labels and the separate Show FVG / Show
+//   IFVG toggles fold into one "FVG / IFVG" master; the C.E. colour and the four
+//   zone label texts are hardcoded, and the C.E. line checkbox is gone — the
+//   midpoint is part of what a zone is, so it always draws. A zone's label states what it IS, so letting
+//   it be renamed only lets the chart disagree with the dashboard, which reads
+//   the same four names. Six inputs removed, one moved: saved settings WILL
+//   scramble — reset to defaults.
+//
+//   REPAIR NOTE: the Helpers section and the Market inputs were destroyed by an
+//   over-wide edit while writing this version and rebuilt by hand. Everything
+//   between MIN_SAMPLE and tfLabel is reconstructed. It verifies clean, but it
+//   has not been compiled on a chart — check the Style tab lists every level and
+//   that the dashboard renders before trusting a session.
+//
+// v2.7
+//   Version numbering changes here. Earlier entries keep their original single
+//   numbers — a history that renumbers itself stops being a record — but from
+//   this release on the scheme is major.minor: 2 for the Internal to External
+//   Liquidity Delivery generation, 7 for its seventh revision. Note v2.7 sorts
+//   BELOW v27 as a plain number, so filenames carry the underscore form
+//   (v2_7) and the changelog order below is newest-first regardless.
+//
+//   Range cap raised to 24 hours, from 18. 1100-0600 — everything outside the
+//   New York morning — is 19 hours and was being refused.
+//   Session arithmetic wraps into 1..1440, so the only length this can now
+//   reject is a range spanning the whole day, which leaves nothing for the
+//   tracking window. Length has stopped screening for reversed windows, which
+//   it was never good at: reversing the range alone breaks the alignment guard,
+//   and reversing both breaks the overlap guard. Both still fire.
+//
+// v27  port review from Session-Based Liquidity Reversals v7.8
+//   1. Standard-candle guard. Every level here is a candle open, and on Heikin
+//      Ashi or Renko those opens are computed rather than traded.
+//   2. -1 rebuilt on RECORDED range opens instead of calendar arithmetic. The
+//      calendar version carried three defects: it anchored on the most recent
+//      start that had ALREADY happened, so setting -1 before the open targeted
+//      yesterday's cycle and expired at the very open it meant to skip; walking
+//      back one calendar day landed on Sunday after a Monday; and the window
+//      close was predicted from the calendar rather than observed. Opens are now
+//      recorded as they occur, so a date with no session cannot be pointed at.
+//      fPrevDateStart, fNextDateStart and fLatestStart are gone.
+//   3. CME clock for non-futures feeds, HELD rather than gated. A perp or CFD
+//      prints through the weekend and would otherwise feed those sessions into
+//      the statistics. Gating each window with cmeOpen would make the daily
+//      17:00-18:00 halt read as outside the window, closing a range at 17:00 and
+//      reopening it at 18:00 as a new one; holding reproduces a futures chart,
+//      where those bars do not exist. Engine blocks run on
+//      barOK = barstate.isconfirmed and cmeOpen. Futures charts bypass it
+//      entirely and are bit-for-bit unchanged.
+//   4. Spread buffer for non-futures charts. A bid-based chart shows a short's
+//      stop and target better than they would fill, since both are ask orders.
+//      Both stops and the short target are buffered; delivery never is, because
+//      it is structural. Input appended at the END of the list so no saved
+//      setting shifts position.
+//   Not ported, and why: EW containment and the DR-final exception contradict
+//   this model (the CISD must come from the delivery that MADE the range, so its
+//   gate is price, not time); MSS -> FVG entry is a different execution model;
+//   R gates and the range-filter fix apply to features removed in v2 and v14.
+//
+// v26
+//   -1 / +1 retained-range lifecycle, ported from Session-Based Liquidity
+//   Reversals v67. A dealing range does not stop mattering because the clock
+//   started a new one: with -1 the scheduled current range is suppressed and
+//   the previous one stays live, levels and state intact, so a tap of its
+//   extreme after the new open still registers as delivery rather than landing
+//   on a range that has already been discarded. With +1 its tracking window
+//   carries through one additional cycle.
+//   Both are latest-cycle controls keyed off last_bar_time, not historical mode
+//   switches — enabling -1 retains one range and leaves every past session
+//   exactly as it was. Delivery or a structural invalidation before the
+//   scheduled open cancels the retention and the new range forms normally;
+//   after the open it stops the extension without rebuilding a partial range
+//   mid-cycle.
+//   The overlap guard now reads the RAW windows. Reading the effective ones
+//   would have silenced a genuine misconfiguration whenever the retention
+//   window happened to suppress one of them.
+//   Session inputs moved inline to carry the checkboxes, which shifts the
+//   positional binding TradingView uses for saved settings — reset settings to
+//   defaults after loading this version.
+//
+// v25
+//   Settings regrouped to match the model: Dealing Range -> Execution ->
+//   Imbalance Confluence. "Levels" had DR high, DR low and EQ sitting beside
+//   CISD and the retest, which are different classes of object — one describes
+//   where the range is, the other how it is traded. CISD and Retest move to a
+//   new Execution group. "DR high/low value" becomes "Show values" and "EQ
+//   value" becomes "Show EQ value", which read as settings rather than objects
+//   now that the group name supplies the context. In Imbalance zones the master
+//   switch becomes "Enable imbalance zones" — clearer against the separate Show
+//   FVG and Show IFVG below it — and "Encompass" becomes "Include".
+//   No input is added, removed or reordered, and TradingView binds saved
+//   settings by source position rather than group, so existing charts keep
+//   their configuration. Labels and grouping only; no logic touched.
+//
+// v24
+//   Renamed Internal to External Liquidity Delivery. "Opening range" was the
+//   wrong object: the extremes of the window ARE the external liquidity, and
+//   everything the model does between them — CISD, retracement band, imbalance
+//   zones — is internal. The old name also described a derivation rather than a
+//   behaviour, which matters here because this range is time-defined while a
+//   dealing range is properly structure-defined. The new name claims neither,
+//   so it stays honest if the range source ever becomes selectable.
+//   OR becomes DR in every label, tooltip, error message and dashboard string.
+//   The engine is untouched — not one line of detection, statistics or drawing
+//   logic changed. Internal identifiers keep their or* prefixes deliberately:
+//   renaming them would produce a large diff with no behavioural content and
+//   make this release impossible to audit against v23.1.
+//   Also fixed a stale comment still referring to the prior-swing option that
+//   was removed in v6.
+//
+// v23.1
+//   Defaults aligned to the working chart: range 1800-0800, tracking 0800-1700,
+//   range-box text transparency 95, band shaded #FFEE58 at 10% opacity, all
+//   imbalance zones at 10%, five live zones, dashboard off by default with its
+//   frame, background and header fully transparent, and the accent pairs set to
+//   #2962FF / #F23645 throughout — aligned and conflicting now match the
+//   bullish and bearish accents rather than using a separate green and orange.
+//
+// v23
+//   "Sessions drawn" added under Mark the target bar. Range boxes, terminated
+//   CISD levels, retest arrows and target marks outlive their session on
+//   purpose — they are the audit trail for the setup statistics — but nothing
+//   bounded them, so they accumulated until Pine silently evicted the oldest at
+//   the 500-object ceiling. How much history was on screen therefore depended
+//   on how many triggers had fired, which is not a rule anyone chose. Each
+//   object is now tagged with the session that created it and pruned at the
+//   next range open. Default 1: today only.
+//   The range box was the worst of it — a new box.new every session with
+//   nothing deleting the old one, while the levels and fib it belonged to were
+//   wiped, so the chart showed boxes without the structure that made them.
+//   Drawing only; the statistics still accumulate over all loaded history.
+//
+// v22
+//   Range ceiling raised from 12 hours to 18. The 12-hour bound was a crude
+//   guard against reversed windows and it was rejecting a full overnight range
+//   — 1800-0800 is 14 hours and a perfectly ordinary configuration. A genuine
+//   reversal of a session-sized window wraps to over 23 hours, so 18 separates
+//   them with room to spare, and the alignment and overlap guards catch most
+//   reversals anyway by their broken pairing with the tracking window.
+//
+// v21
+//   Timeframe bound set at 15m. v20 removed the ceiling entirely on the
+//   grounds that the bar-count and divisibility rules already reject anything
+//   unworkable, which is true arithmetically but not the whole argument: past
+//   roughly 15m the CISD is the open of a very coarse candle and the trigger a
+//   close of the same size, far enough from the level that it is a different
+//   proposition rather than a coarser view of the same one. The bar-count and
+//   divisibility rules remain the primary filter; this is an outer bound.
+//
+// v20
+//   The 1m-to-5m ceiling is removed. It was a blunt restriction standing in for
+//   the two rules that actually decide whether a configuration can work: at
+//   least six bars in the range, and the range divisible by the bar size. Those
+//   already reject everything unworkable, and they do it on the pair of values
+//   that matters rather than on the timeframe alone. A 420m evening range is 28
+//   bars on a 15m chart and was being refused for no reason the model requires.
+//   Minute charts are still the only ones accepted; the bar-count error now
+//   reports how many bars the configuration actually produces.
+//
+// v19
+//   Windows may cross midnight. An 1800-0100 opening range is a legitimate
+//   configuration for the futures evening open, and two things broke on it:
+//   1. sessMinutes did same-day arithmetic, so 1800-0100 read as -1020 minutes.
+//      It wraps now. The v18 "reversed or crosses midnight" rejection was the
+//      wrong fix — it enforced a limitation that was mine, not the model's.
+//      Wrapping makes a reversed window indistinguishable from a very long one,
+//      so a 12-hour ceiling catches that instead.
+//   2. Daily housekeeping ran at NY midnight, which falls INSIDE an evening
+//      range. It emptied the pending queue and nulled both swing pointers
+//      mid-range. It now runs when the tracking window closes — the one instant
+//      guaranteed to be outside both windows whatever they are set to.
+//   Windows are also checked for overlap, which can no longer be decided from
+//   the strings alone once they wrap, so it is tested against the sessions.
+//
+// v18
+//   Session windows are validated before anything is derived from them, and
+//   every guard now quotes the string it read. A reversed or unreadable window
+//   used to fall through to the bar-count check, which reported a negative
+//   length and blamed the timeframe — the message named a symptom rather than
+//   the field at fault. Reversed and midnight-crossing windows are rejected
+//   explicitly for both the range and the tracking window.
+//   Note for future edits: TradingView binds saved settings positionally, so
+//   removing an input can leave a stored value attached to whichever field
+//   takes its slot on charts where the indicator is already applied. Prefer
+//   deprecating an input in place over deleting it from the middle of the list.
+//
+// v17
+//   1. The structural-kill branch was still DELETING the trigger arrow after an
+//      entry, while the statistics went on recording that the trade happened —
+//      chart and counters disagreeing, which is exactly what v12 set out to
+//      stop. It now keeps the arrow, mutes it and prints an × at the exit bar,
+//      matching the two-engulf branch.
+//   2. Post-entry exits split: 3 is the two-engulf rule, 5 is structural
+//      failure. They were one bucket labelled "the two-engulf rule closed the
+//      trade", which was no longer true. The two-engulf rule was a deliberate
+//      choice and cannot be judged without knowing how often it closed a trade
+//      structure had not yet invalidated. The research row now reads
+//      engulf · struct · ambiguous.
+//   3. A lock exactly at EQ gave the baseline an arbitrary NEARER LOW, because
+//      the test was a single `<`. Ties are now excluded from the baseline and
+//      counted separately, so the comparison is not handed a free bearish tilt.
+//   4. Delivery is terminal for the drawings too: the CISD line stops extending
+//      and fades, and zones stop maintaining. An extending level under a
+//      DELIVERED panel implied it still mattered. Range levels and fib remain.
+//
+// v16
+//   Defaults aligned to the working chart: tracking window 1000-1200, level
+//   labels "H" and "L", fib levels 1.0 / 0.5 / 0.0 off, retracement band shaded
+//   by default. Also fixed the level-label defaults, which a blanket rename in
+//   v13 had turned into the literal strings "the range high" / "the range low".
+//
+// v15
+//   Delivery ends the session, always — "Freeze session on target" removed. It
+//   contradicted the model's own definition: with it off, a CISD could arm and
+//   trigger after the draw on liquidity had already been delivered, and
+//   targetHit stayed true beneath a later trigger the panel could not express.
+//   Historical always prints its denominator: "80.0% · n=10 · AGREES". A rate
+//   without its sample size is the easiest number on a panel to over-trust,
+//   and formation order is this model's single hypothesis. MIN_SAMPLE raised
+//   from 8 to 20 for every other statistic.
+//   Volume moved behind a toggle, default OFF. It is a close-location proxy,
+//   not order flow, it is not an ICT prerequisite and it gates nothing, so
+//   CONFLICTING under a valid setup asked the trader to weigh something with
+//   no bearing on the decision. The calculation still runs for research.
+//   Execution panel regrouped: thesis (Formation / Delivery / Historical),
+//   blank, execution (Setup / CISD / Confluence).
+//   Dead code removed: fmtR, modelTxt, zoneInBand. Stale expectancy and
+//   "entry zone" wording corrected, and the killCisdDraw note no longer
+//   describes multiple attempts per session.
+//
+// v14
+//   ONE TRADE PER FORMATION. Before an entry a structural kill may retire a
+//   CISD and a replacement may be hunted; once an entry has fired the model is
+//   committed, so no second CISD is sought and no second entry can be taken.
+//   A structural break after entry now ends the trade instead of resuming the
+//   hunt, and the two-engulf exit can no longer re-arm the same level.
+//   R:R and expectancy REMOVED, display and calculation. Both rested on
+//   entering at the CISD level, but the trigger is a confirmed close THROUGH
+//   it, so every figure assumed an execution price the trader could not have
+//   had. R:R is also not part of the model's decision process, and shown after
+//   a trigger it only reports what was missed. Outcome counts stay.
+//   Ambiguous triggers are excluded from the outcome DENOMINATOR, not just the
+//   numerators, which had understated every rate.
+//   Confluence is directional: polarity of the zone actually inside the band,
+//   compared with the intended direction. It could previously report IFVG IN
+//   BAND because an FVG was in the band and an unrelated IFVG existed.
+//   Formation is coloured by what it implies, not by the extreme it names —
+//   high first delivers DOWN, so it wears the bearish accent.
+//   "Bias / Target BREAK LOW" becomes "Delivery OR LOW". A touch fills the
+//   objective; nothing has to break. Break High / Break Low survives only in
+//   the research block, where a break is what is measured.
+//   "Entry band" renamed "Retracement band" — it never gated entries.
+//   Full name shown in the chart legend; the ORLD shorttitle is gone.
+//
+// v13
+//   Renamed Opening Range Liquidity Delivery (ORLD). The table was trying to be
+//   a research report and an execution dashboard at once and served neither, so
+//   it now has two views. Default is execution: formation, bias and target,
+//   historical agreement, setup state, CISD level, today's R:R, confluence, and
+//   volume as the quietest row. "Detailed statistics" adds the range-outcome
+//   and setup-outcome blocks, rule-versus-baseline and the diagnostic footer.
+//   Everything is still calculated every bar either way.
+//   Today's R:R replaces the historical average on screen — prospective while
+//   armed, frozen at the entry value once triggered. The historical average is
+//   structurally >= 1 because of the EQ rule, so it describes the rule rather
+//   than the opportunity.
+//
+// v12  correctness / research release. No new model features.
+//   1. Historical triggers are never deleted. The arrow stays, is muted, and an
+//      × is added at the exit bar; a confirmed CISD line is terminated and
+//      faded rather than removed. Erasing them left the chart showing something
+//      no trader ever saw and made the setup counters unauditable.
+//   2. everTriggered (permanent) split from tradeActive (still open). They were
+//      one flag, so a trade could be un-fired on the chart while the statistics
+//      went on scoring it. The two-engulf rule can only fire AFTER entry, so it
+//      is an exit and is recorded as its own outcome.
+//   3. Target and stop resolve together on one bar. Scoring them in sequence
+//      meant an outside bar touching both registered the target and skipped the
+//      stop entirely, so every ambiguous bar became a win. Ambiguous is now its
+//      own bucket, excluded from the rates rather than guessed.
+//   4. Fill separated from break. Reaching a price is a touch and always
+//      inclusive; Break measure governs only the range-outcome statistic. The
+//      stop had been exclusive while the target was inclusive, biasing the same
+//      direction as (3).
+//   5. Tracking start must equal range end, and the range must divide evenly
+//      into chart bars. Enforced, not warned: a late start left a blind window
+//      in which a target or stop could occur unseen.
+//   6. CISD conversion rate displayed — already collected, never shown.
+//   7. Avg R:R at entry and expectancy in R added.
+//   8. Dead state removed: Cisd.mt, bLo, bHi, the six parallel arrays feeding
+//      them, and the unused run-extent walks. "CONFIRMS" softened to "AGREES".
+//
+// v11
+//   Opening range default 0930-1000, tracking 1000-1600. Any window may be
+//   used; the guard reads the range length rather than assuming one, and
+//   allows 1m-5m charts provided the range holds at least six bars.
+//   Formation order falls back to the 1m series when both extremes land on one
+//   chart bar, instead of skipping the session.
+//   New Setup Statistics block: triggered / target after trigger / invalidated
+//   / no delivery, bucketed by formation. The formation block answers which
+//   side broke; this answers whether the tradeable sequence paid. Percentages
+//   are withheld below MIN_SAMPLE observations and the raw count shown.
+//   New "Rule vs baseline" row scoring formation order against a naive
+//   nearest-boundary call over the same directional sessions.
+//   Removed: Prior structure lookback (provably inert), Gate retests by EQ
+//   (unreachable since EQ became a formation rule in v3), PRE_OPEN_BARS.
+//   Note: changing any input recalculates the script from scratch, so the
+//   counters reset by themselves when the range length changes.
+//
+// v10
+//   1. Outside-bar pivot collision. A wide-range bar can be both a pivot high
+//      and a pivot low; the low branch ran first and wrote swLoBar, so the high
+//      branch then saw swLoBar == hiBar and refused to build. On 07 Jul 2026
+//      that bar was 09:30, the bar that made the range high. Both branches now
+//      read a snapshot of structure taken before either one writes.
+//   2. Anchor reverted to the reversal engine's convention: the level is the
+//      open of the LAST candle of the run, the one closest to the swing. The
+//      v5 "leg start" variant was inferred from a hand-drawn line; against the
+//      07 Jul bars, last-of-run reproduces the plotted 29593.75 exactly while
+//      leg start gives 29590.25.
+//
+// v9
+//   Design error from v6, exposed by 07 Jul 2026. The range constraint on the
+//   CISD level was removed in v6 on a wrong diagnosis, at the same time as
+//   structure registration became continuous and the lookback stayed at 90
+//   bars. "Anchor to the extreme swing" then meant the highest swing anywhere
+//   in the lookback rather than the swing that delivered the range: on a
+//   session that sold off into the open it anchored at 08:10, 195 points above
+//   the range high. 12 Aug could not reveal it because that session rallied into the
+//   open, so the highest swing WAS the range high.
+//   Confirmation now requires the level AND its protective swing to sit inside
+//   the range. Lookback default cut to 30 bars.
+//
+// v8
+//   1. The CISD line now starts on the candle whose OPEN is the level. It was
+//      starting on the run anchor, which on a leg-start level is a different,
+//      later candle, so the line did not touch the open it was drawn from.
+//   2. The line stops where the fib lines stop instead of running past them.
+//      The "Line length" input is gone with it.
+//   3. Zone default colours changed; IFVG inherits the opposite hue to the FVG
+//      it inverted from.
+//   4. "Neutral" removed from the dashboard: it defaulted to the same value as
+//      the body text colour and did nothing that panelMuted did not already do.
+//
+// v7
+//   THE bug, present since v1. Swing-structure registration was gated on
+//   `not frozen`, and `frozen` is only cleared at the opening bell. A session
+//   that reached its target therefore suppressed every pivot from that moment
+//   until the next day's bell, including the whole pre-market. On 12 Aug 2026
+//   this left swLoBar na when the 09:30 swing high confirmed at 09:32, so the
+//   block carrying 29967.25 was never built; the queue held only three blocks
+//   anchored after 09:45, all below EQ, and no CISD could ever form.
+//   Registration is now ungated, and frozen/targetHit/setupFired also clear at
+//   the daily boundary. Verified against the 12 Aug bar data: queue goes from
+//   3 blocks (best 29907.00, blocked) to 4 (best 29967.25, confirms 09:45).
+//
+// v6
+//   1. Swing structure is now tracked on EVERY bar. The session-string
+//      "structure window" never fired, so no pre-open pivot was registered and
+//      the 09:26 swing low could not anchor the 09:30 block — the live queue
+//      held only post-09:45 blocks, all below EQ, and no CISD could form.
+//      Replaced by a daily clear plus a lookback trimmed in bars.
+//   2. Options removed. The 12 Aug replay settled which behaviour is right, so
+//      leg-start anchoring, extreme-swing selection and the EQ rule are model
+//      rules now rather than toggles. Five inputs became one.
+//
+// v5
+//   Leg-start anchor added and made the default, verified by replaying the
+//   12 Aug 2026 MNQ session bar by bar. Both run conventions produced
+//   29982.75 there and no entry, because the up-leg into the 09:30 high has a
+//   down-close at 09:28 that collapses the unbroken run onto 09:29 alone.
+//   Leg start anchors at 09:27, the first up-close after the 09:26 swing low,
+//   giving 29967.25 — in band, above EQ, retest fires 09:49 at 29961.25.
+//
+// v4
+//   1. The CISD row now explains itself when no level has printed: whether
+//      nothing was queued, the best queued level is on the wrong side of EQ,
+//      or a valid level is waiting on a close through it, plus the queue depth.
+//   2. Target detection moved to confirmed bars, so it can no longer report
+//      MISSED / TARGET REACHED while Session Outcome is still unresolved.
+//
+// v3
+//   1. Extreme anchoring. Confirmation used to take the OLDEST confirming
+//      block, which is the nearest swing and gives away most of the range.
+//      It now takes the most extreme confirming level — highest for a short,
+//      lowest for a long — so the CISD sits at the swing the range was
+//      delivered from.
+//   2. EQ is now a formation rule, not just a retest gate. A short's CISD may
+//      never form below the range EQ, a long's never above it.
+//   3. Run anchor convention. The level can sit on the FIRST candle of the
+//      consecutive run (classic CISD reading, default here) or the last one
+//      (the reversal engine's convention).
+//   4. Footer reports the active anchor mode and warns when 'OR + prior
+//      swing' found no pre-open structure to work with.
+//
+// v2
+//   1. the old prior-swing option actually works. It was inert: the bell cleared the
+//      pending queue, and the anchor gate rejected any open outside the range.
+//      Pivot seeding now has its own window, the queue survives the bell in
+//      that mode, and structure alone governs anchor eligibility.
+//   2. Range filter and alerts removed.
+//   3. Zone labels carry their own text colour, background and size.
+//
+// v1
+//   Initial fork. Forward-only confirmation: pending blocks are queued from
+//   the opening bell but the first eligible confirmation is taken from the
+//   OR close onward, because the direction is not known until the range
+//   locks. A block that both formed AND confirmed before the lock is missed by
+//   design; retroactive scanning is a v2 decision.
+// ─────────────────────────────────────────────────────────────────────────
+// No shorttitle: TradingView shows it in place of the title when present,
+// and the full name is what should appear on the chart.
+indicator("Internal to External Liquidity Delivery", overlay = true,
+     max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500,
+     max_bars_back = 1000)   // dynamic close[off] references in the anchor
+                             // walk; Pine cannot infer the buffer for those
+
+const string NYTZ = "America/New_York"
+
+// ─── Market ───────────────────────────────────────────────────────────────
+// First in the list: on a perpetual it is the first thing to check, and a
+// weekend session quietly feeding the statistics is the costliest thing here
+// to get wrong.
+grpM = "Market"
+cmeClockOn = input.bool(true, "Hold perpetual futures to the CME clock", group = grpM,
+     tooltip = "On: a perpetual or CFD that mirrors a CME market ignores bars from Friday 17:00 to Sunday 18:00 New York and in the daily 17:00-18:00 halt, exactly as the futures contract does. Off: the feed runs 24/7.\n\nThe test is the symbol type, so this covers any non-futures feed, not only perpetuals. A futures chart is never affected either way.\n\nTurn it OFF on a genuine 24/7 market with no CME session to mirror, such as a crypto perpetual.")
+
+// ─── Dealing range ────────────────────────────────────────────────────────
+grpOR = "Dealing range"
+orSess    = input.session("1800-0800", "Dealing range (ET)", group = grpOR, inline = "dr",
+     tooltip = "The dealing range. Any window may be used; the model reads its length rather than assuming one. High and low are wick extremes and DST is handled automatically. Changing this resets the accumulated statistics, because a 30-minute sample and a 15-minute sample are different populations.")
+prevDR    = input.bool(false, "-1", group = grpOR, inline = "dr",
+     tooltip = "Keep the PREVIOUS dealing range live instead of starting the scheduled current one. Use it when yesterday's range is still the reference price is working inside and today's open would otherwise discard it. This is a latest-cycle control, not a historical mode: enabling it does not shift every past session backwards. Delivery or a structural invalidation before the scheduled open cancels it and the new range forms normally.")
+trackSess = input.session("0800-1700", "Tracking window (ET)", group = grpOR, inline = "tw",
+     tooltip = "Where the setup is hunted and the target is measured. It must START WHEN THE OPENING RANGE ENDS. Starting it earlier does not extend the CISD search backwards and it drags the previous session's levels across the pre-market.")
+extTrack  = input.bool(false, "+1", group = grpOR, inline = "tw",
+     tooltip = "With -1 enabled, carry the retained range's tracking window through one additional cycle, so it can still deliver after the scheduled open has passed. Delivery or a structural invalidation stops the extension; the skipped range is not rebuilt mid-cycle. Ignored unless -1 is on.")
+breakMeasure = input.string("Wick", "Break measure", options = ["Close", "Wick"], group = grpOR,
+     tooltip = "How a break of a range extreme is confirmed for the RANGE OUTCOME statistic: did price trade beyond the boundary. Close = a bar must close beyond it. Wick = any trade beyond it counts. Target and stop fills are separate and always inclusive touches, because reaching a price is not the same question as breaking a level.")
+markTarget = input.bool(true, "Mark the target bar", group = grpOR)
+histSessions = input.int(1, "Sessions drawn", minval = 1, maxval = 100, group = grpOR,
+     tooltip = "How many sessions of range boxes, CISD levels, retest arrows and target marks stay on the chart. 1 shows today only. Raise it when auditing the research panel against the chart, then put it back. This affects drawing only — the statistics accumulate over all loaded history either way.")
+
+// ─── Levels ───────────────────────────────────────────────────────────────
+// Range structure and execution structure are different classes of object, so
+// they get different groups. DR high, DR low and EQ describe where the range
+// is; CISD and the retest describe how it is traded. Note the inputs below are
+// NOT reordered — TradingView binds saved settings by position in the source,
+// so regrouping them is safe for charts the indicator is already on.
+grpL = "Dealing range levels"
+orHiOn    = input.bool(true, "DR high", group = grpL, inline = "lh")
+orHiCol   = input.color(color.new(#424351, 50), "", group = grpL, inline = "lh")
+orHiTxt   = input.string("DR H", "", group = grpL, inline = "lh")
+orHiWidth = input.int(1, "Width", minval = 1, maxval = 5, group = grpL, inline = "lh")
+
+orLoOn    = input.bool(true, "DR low", group = grpL, inline = "ll")
+orLoCol   = input.color(color.new(#424351, 50), "", group = grpL, inline = "ll")
+orLoTxt   = input.string("DR L", "", group = grpL, inline = "ll")
+orLoWidth = input.int(1, "Width", minval = 1, maxval = 5, group = grpL, inline = "ll")
+
+orValOn  = input.bool(true, "Show values", group = grpL, inline = "lv")
+orValCol = input.color(color.new(#424351, 50), "", group = grpL, inline = "lv")
+
+eqOn    = input.bool(true, "EQ", group = grpL, inline = "eq")
+eqCol   = input.color(color.new(#424351, 50), "", group = grpL, inline = "eq")
+eqStyle = input.string("Dashed", "", options = ["Solid", "Dotted", "Dashed"], group = grpL, inline = "eq")
+eqWidth = input.int(1, "Width", minval = 1, maxval = 5, group = grpL, inline = "eq")
+
+eqValOn  = input.bool(true, "Show EQ value", group = grpL, inline = "ev")
+eqValCol = input.color(color.new(#424351, 50), "", group = grpL, inline = "ev")
+
+// ─── Execution ────────────────────────────────────────────────────────────
+grpX = "Execution"
+cisdOn      = input.bool(true, "CISD", group = grpX, inline = "cs")
+cisdBearCol = input.color(#F23645, "", group = grpX, inline = "cs")
+cisdBullCol = input.color(#2962FF, "", group = grpX, inline = "cs")
+cisdStyle   = input.string("Solid", "", options = ["Solid", "Dotted", "Dashed"], group = grpX, inline = "cs")
+cisdWidth   = input.int(2, "Width", minval = 1, maxval = 5, group = grpX, inline = "cs")
+
+rtDnCol    = input.color(#F23645, "Retest", group = grpX, inline = "rt")
+rtUpCol    = input.color(#2962FF, "", group = grpX, inline = "rt")
+retestSize = input.string("Small", "", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = grpX, inline = "rt")
+
+// ─── Range box ────────────────────────────────────────────────────────────
+grpBox = "Range box"
+showOrBox  = input.bool(true, "Dealing range box", group = grpBox, inline = "bx")
+orBoxCol   = input.color(color.new(#424351, 50), "", group = grpBox, inline = "bx")
+showBoxTxt = input.bool(true, "Display label", group = grpBox)
+boxTxtSize = input.string("Auto", "Text size", options = ["Auto", "Tiny", "Small", "Normal", "Large", "Huge"], group = grpBox)
+int BOX_TRANSP = 93
+txtTransp  = input.int(95, "Text transparency", minval = 0, maxval = 100, group = grpBox)
+
+// ─── Fib levels ───────────────────────────────────────────────────────────
+// Anchors are ordered by which extreme formed FIRST inside the range: the
+// earlier extreme carries 1, the later one carries 0. On a range that made
+// its high first, 1 sits at the high, 0 at the low, and the ratios read down
+// into the range toward the target.
+grpF = "Fib levels"
+fibOn     = input.bool(true, "Fib retracement", group = grpF, inline = "f0")
+fibCol    = input.color(color.new(#424351, 50), "", group = grpF, inline = "f0")
+fibStyle  = input.string("Dotted", "", options = ["Solid", "Dotted", "Dashed"], group = grpF, inline = "f0")
+fibWidth  = input.int(1, "Width", minval = 1, maxval = 5, group = grpF, inline = "f0")
+
+fibValOn  = input.bool(true, "Fib value", group = grpF, inline = "f1")
+fibValCol = input.color(color.new(#424351, 50), "", group = grpF, inline = "f1")
+
+fLv1On = input.bool(false, "Level 1", group = grpF, inline = "fv1")
+fLv1   = input.float(1.0,   "", group = grpF, inline = "fv1")
+fLv2On = input.bool(true,  "Level 2", group = grpF, inline = "fv2")
+fLv2   = input.float(0.786, "", group = grpF, inline = "fv2")
+fLv3On = input.bool(true,  "Level 3", group = grpF, inline = "fv3")
+fLv3   = input.float(0.705, "", group = grpF, inline = "fv3")
+fLv4On = input.bool(true,  "Level 4", group = grpF, inline = "fv4")
+fLv4   = input.float(0.618, "", group = grpF, inline = "fv4")
+fLv5On = input.bool(false, "Level 5", group = grpF, inline = "fv5")
+fLv5   = input.float(0.5,   "", group = grpF, inline = "fv5")
+fLv6On = input.bool(true,  "Level 6", group = grpF, inline = "fv6")
+fLv6   = input.float(0.382, "", group = grpF, inline = "fv6")
+fLv7On = input.bool(true,  "Level 7", group = grpF, inline = "fv7")
+fLv7   = input.float(0.236, "", group = grpF, inline = "fv7")
+fLv8On = input.bool(false, "Level 8", group = grpF, inline = "fv8")
+fLv8   = input.float(0.0,   "", group = grpF, inline = "fv8")
+
+bandLoR = input.float(0.618, "Retracement band", minval = 0.0, maxval = 1.0, step = 0.001, group = grpF, inline = "bd")
+bandHiR = input.float(0.786, "", minval = 0.0, maxval = 1.0, step = 0.001, group = grpF, inline = "bd",
+     tooltip = "The OTE retracement band. It is scored as confluence and reported on the panel; it does not gate the CISD, the trigger or anything else.")
+bandShow = input.bool(true, "Shade the band", group = grpF, inline = "bd2")
+bandCol  = input.color(color.new(#FFEE58, 90), "", group = grpF, inline = "bd2")
+
+// ─── Imbalance zones ──────────────────────────────────────────────────────
+// FVG geometry, volume-imbalance encompassing and the inversion rule are
+// lifted from the IFVG script. The session filter is replaced by an
+// overlap test against the dealing range: a gap that does not touch the
+// range is not part of this model.
+grpZ = "Imbalance zones"
+// Order here is already master -> visibility -> detection -> management ->
+// appearance: do I want them, what qualifies, how do they behave, how do they
+// look. Nothing is reordered, only reworded.
+zoneOn      = input.bool(true, "FVG / IFVG", group = grpZ)
+fvgBullCol  = input.color(color.new(#9C9C9C, 90), "Bull FVG Color",  group = grpZ, inline = "zc")
+fvgBearCol  = input.color(color.new(#FF9800, 90), "Bear FVG Color",  group = grpZ, inline = "zc")
+ifvgBullCol = input.color(color.new(#FF9800, 90), "Bull IFVG Color", group = grpZ, inline = "zi")
+ifvgBearCol = input.color(color.new(#9C9C9C, 90), "Bear IFVG Color", group = grpZ, inline = "zi")
+zoneThresh  = input.float(0.0, "Min gap size %", minval = 0.0, step = 0.01, group = grpZ,
+     tooltip = "Minimum gap as a percentage of price. 0 = accept all. On NQ ~29000: 0.02 = gaps of about 5.8 points.")
+requireMidClose = input.bool(false, "Require middle-candle close", group = grpZ,
+     tooltip = "Off = pure ICT three-candle definition. On = the middle candle must also close beyond the far candle, which silently rejects some valid gaps. Off is the safer default when the first gap in the range matters.")
+encompassVI = input.bool(true, "Include volume imbalances", group = grpZ,
+     tooltip = "Expand zone boundaries out to adjacent body gaps beside the middle candle. Each side expands independently.")
+zoneMit     = input.string("Close", "Mitigation by", options = ["Close", "Wick"], group = grpZ,
+     tooltip = "How a zone is judged violated. A violated FVG inverts into an IFVG of opposite polarity; a violated IFVG is removed.")
+maxZones    = input.int(5, "Max live zones", minval = 1, maxval = 24, group = grpZ)
+zoneLbl     = input.bool(true, "Label", group = grpZ, inline = "zl")
+zoneLblTxt  = input.color(color.new(#424351, 50), "", group = grpZ, inline = "zl")
+zoneLblBg   = input.color(color.new(#F4F4F7, 100), "", group = grpZ, inline = "zl")
+zoneLblSize = input.string("small", "", options = ["tiny", "small", "normal", "large"], group = grpZ, inline = "zl")
+
+// The C.E. line is part of what a zone IS — its midpoint is the level price
+// actually reacts to — so it is drawn always, with a fixed colour. Its colour
+// and the four label texts are fixed for the same reason. A zone's label states
+// what it IS — +FVG, -FVG, +IFVG, -IFVG — so letting it be renamed only lets
+// the chart disagree with the dashboard, which reads the same four names.
+color  zoneCECol    = color.new(#424351, 0)
+string zoneLblBull  = "+FVG"
+string zoneLblBear  = "-FVG"
+string zoneLblBullI = "+IFVG"
+string zoneLblBearI = "-IFVG"
+
+// ─── Dashboard ────────────────────────────────────────────────────────────
+grpD = "Dashboard"
+showPanel   = input.bool(false, "Show dashboard", group = grpD)
+showVolumeRow = input.bool(false, "Show volume row", group = grpD,
+     tooltip = "Off by default. The volume reading is a close-location proxy, not order flow and not an ICT prerequisite, and it gates nothing — so CONFLICTING under a valid setup asks the trader to weigh something that has no bearing on whether to take it. The calculation still runs, and the alignment flag is available in the research view for testing whether it contributes anything.")
+showDetailed = input.bool(false, "Detailed statistics", group = grpD,
+     tooltip = "Off: the execution view — today's thesis, whether the setup is valid, where the objective is, and whether history agrees. On: adds the range-outcome and setup-outcome research blocks, the rule-versus-baseline comparison and the diagnostic footer. Everything is calculated either way; this only controls what is on screen while you trade.")
+panelPos    = input.string("Bottom left", "Position", group = grpD, inline = "d1",
+     options = ["Top left", "Top center", "Top right", "Middle left", "Middle center", "Middle right", "Bottom left", "Bottom center", "Bottom right"])
+panelSize   = input.string("Normal", "", options = ["Tiny", "Small", "Normal", "Large"], group = grpD, inline = "d1")
+panelBorderW = input.int(1, "Border", minval = 0, maxval = 3, group = grpD, inline = "d2")
+panelBorderC = input.color(color.new(#F4F4F7, 100), "", group = grpD, inline = "d2")
+panelBg     = input.color(color.new(#F4F4F7, 100), "Background", group = grpD, inline = "d3")
+panelTxt    = input.color(color.new(#424351, 50), "Text", group = grpD, inline = "d3")
+panelHeadBg = input.color(color.new(#F4F4F7, 100), "Header", group = grpD, inline = "d4")
+panelMuted  = input.color(color.new(#424351, 50), "Muted", group = grpD, inline = "d4")
+buyColor      = input.color(#2962FF, "Bullish accent", group = grpD, inline = "d5")
+sellColor     = input.color(#F23645, "Bearish accent", group = grpD, inline = "d5")
+alignedColor  = input.color(#2962FF, "Aligned", group = grpD, inline = "d6")
+conflictColor = input.color(#F23645, "Conflicting", group = grpD, inline = "d6")
+
+// Below this many observations a percentage is more misleading than the raw
+// count, so the count is printed instead. The Historical row is the exception:
+// it always prints BOTH, because 80% from 10 sessions reads far stronger than
+// it deserves, and the denominator is the whole point when formation order is
+// the model's single hypothesis.
+const int MIN_SAMPLE = 20
+
+// Volume-context interpretation bands. Fixed, to keep the interface small.
+const float VOL_NEUTRAL_PCT  = 5.0
+const float VOL_MODERATE_PCT = 10.0
+const float VOL_STRONG_PCT   = 20.0
+
+// Detection constants. Not user settings.
+int killCloses = 2      // consecutive body closes through a level
+int NAME_OFF   = 1      // label column offsets, in bars past the line end
+int VAL_OFF    = 5
+float RT_OFF_PCT = 0.03 // retest glyph offset as a fraction of the range
+
+// ─── Helpers ──────────────────────────────────────────────────────────────
+styleOf(string s) =>
+    s == "Dotted" ? line.style_dotted : s == "Dashed" ? line.style_dashed : line.style_solid
+
+sizeOf(string s) =>
+    switch s
+        "Tiny"   => size.tiny
+        "Small"  => size.small
+        "Normal" => size.normal
+        "Large"  => size.large
+        "Huge"   => size.huge
+        => size.auto
+
+// The zone-label dropdown uses lower-case options.
+zoneSizeOf(string s) =>
+    s == "tiny" ? size.tiny : s == "normal" ? size.normal : s == "large" ? size.large : size.small
+
+posOf(string s) =>
+    switch s
+        "Top left"      => position.top_left
+        "Top center"    => position.top_center
+        "Top right"     => position.top_right
+        "Middle left"   => position.middle_left
+        "Middle center" => position.middle_center
+        "Middle right"  => position.middle_right
+        "Bottom left"   => position.bottom_left
+        "Bottom center" => position.bottom_center
+        => position.bottom_right
+
+fmtP(float v) =>
+    na(v) ? "-" : str.tostring(v, format.mintick)
+
+fmtPct(float v) =>
+    na(v) ? "n/a" : str.tostring(v, "#.0") + "%"
+
+// Percentage only once the sample can support one; otherwise the bare count.
+fmtStat(float v, int n) =>
+    n == 0 ? "-" : n < MIN_SAMPLE ? "n=" + str.tostring(n) : fmtPct(v)
+
+sessStartHM(string sess) =>
+    int(str.tonumber(str.substring(sess, 0, 4)))
+
+sessEndHM(string sess) =>
+    int(str.tonumber(str.substring(sess, 5, 9)))
+
+// Length of a session window in minutes, WRAPPING across midnight. An 1800-0100
+// range is seven hours, not minus seventeen. TradingView's own session handling
+// wraps, so this arithmetic has to as well.
+sessMinutes(string sess) =>
+    float sH = str.tonumber(str.substring(sess, 0, 2))
+    float sM = str.tonumber(str.substring(sess, 2, 4))
+    float eH = str.tonumber(str.substring(sess, 5, 7))
+    float eM = str.tonumber(str.substring(sess, 7, 9))
+    float raw = (eH * 60 + eM) - (sH * 60 + sM)
+    na(raw) ? int(na) : int(raw <= 0 ? raw + 1440 : raw)
+
+// Absolute session-start timestamp on the calendar day of refTime.
+fStartOnDate(string sess, int refTime) =>
+    timestamp(NYTZ, year(refTime, NYTZ), month(refTime, NYTZ), dayofmonth(refTime, NYTZ),
+         sessStartHM(sess) / 100, sessStartHM(sess) % 100)
+
+// The cycle -1 targets. A window that crosses midnight belongs to the day it
+// STARTED: between midnight and its end, the cycle in progress opened the
+// previous evening. Without this, -1 set at 03:00 on the default 1800-0800
+// range targets tonight's 18:00 open and leaves the range actually in progress
+// to be discarded — the exact thing it exists to prevent.
+fLatestTarget(string sess, int refTime) =>
+    int st  = sessStartHM(sess) / 100 * 60 + sessStartHM(sess) % 100
+    int en  = sessEndHM(sess)   / 100 * 60 + sessEndHM(sess)   % 100
+    int now = hour(refTime, NYTZ) * 60 + minute(refTime, NYTZ)
+    int t   = fStartOnDate(sess, refTime)
+    if en <= st and now < en
+        t := fStartOnDate(sess, refTime - 86400000)
+    t
+
+tfLabel() =>
+    timeframe.isseconds ? str.tostring(timeframe.multiplier) + "s" :
+     timeframe.isminutes ? str.tostring(timeframe.multiplier) + "min" :
+     timeframe.isdaily ? "1D" : timeframe.period
+
+// ─── Guard ────────────────────────────────────────────────────────────────
+// Minute charts, 1 to 5. The range must also hold enough bars to host a swing:
+// a 2/2 pivot needs five bars and confirms on the fifth, so below six bars the
+// range cannot produce a single confirmed swing of its own and the model would
+// depend entirely on pre-open structure.
+int   orMinutes = sessMinutes(orSess)
+float tfMinutes = timeframe.in_seconds() / 60.0
+
+// Validate the windows BEFORE anything is derived from them. A reversed or
+// unreadable session used to fall through to the bar-count check, which then
+// reported a nonsense negative length and named the timeframe rather than the
+// field actually at fault. Every message below quotes the string it read, so
+// the error identifies the input instead of describing a symptom.
+//
+// The usual cause of a session holding something unexpected is TradingView
+// binding saved settings positionally: inputs removed in an earlier version
+// can leave a stored value attached to whichever field now sits in that slot.
+// Resetting the indicator's settings to defaults clears it.
+if na(orMinutes)
+    runtime.error("Could not read the dealing range window: \"" + orSess + "\". Expected HHMM-HHMM. Reset the indicator settings to defaults.")
+// A range may run up to, but not including, 24 hours. Session arithmetic wraps
+// into 1..1440, so a range that spans the whole day leaves nothing for tracking
+// and is the only length this can reject.
+//
+// Length no longer screens for a reversed window, and it never really did. Both
+// reversal cases are caught properly elsewhere: reverse the range alone and the
+// alignment guard sees tracking no longer starting where the range ends;
+// reverse both and the overlap guard sees a bar inside each window at once.
+//
+// That bound was too tight twice, at 12 hours and at 18, and each time it
+// refused an ordinary configuration — 1800-0800 is 14 hours, 1100-0600 is 19.
+// The pattern is worth keeping in mind: a bound invented to catch a mistake
+// keeps catching normal use when the mistake and the normal case are not
+// actually separated by the quantity being measured.
+if orMinutes >= 1440
+    runtime.error("Dealing range \"" + orSess + "\" spans the full 24 hours, leaving nothing for the tracking window. Check the start and end are the right way round.")
+if na(sessStartHM(trackSess)) or na(sessEndHM(trackSess))
+    runtime.error("Could not read the tracking window: \"" + trackSess + "\". Expected HHMM-HHMM.")
+// Minute charts, 1m to 15m. Seconds and daily-or-higher cannot resolve an
+// dealing range at all; above 15m the CISD becomes the open of a very coarse
+// candle and the trigger a close of the same size, which is a different
+// instrument from the one this model was tested on rather than a finer or
+// blunter view of it. The bar-count and divisibility rules below still do the
+// real filtering — this is an outer bound, not the primary gate.
+// Every level this script draws is a candle open. On Heikin Ashi, Renko or any
+// other synthetic series those opens are computed rather than traded, so every
+// CISD would sit at a price nobody transacted at.
+if not chart.is_standard
+    runtime.error("Use standard candles. Heikin Ashi, Renko and other synthetic charts move the levels this indicator draws.")
+if not timeframe.isminutes or timeframe.multiplier > 15
+    runtime.error("Internal to External Liquidity Delivery runs on 1m to 15m charts only. Seconds, daily and higher timeframes cannot resolve a dealing range.")
+if orMinutes / tfMinutes < 6
+    runtime.error("Dealing range too short for this timeframe: \"" + orSess + "\" is " + str.tostring(orMinutes) + "m, which on a " + str.tostring(timeframe.multiplier) + "m chart is " + str.tostring(orMinutes / tfMinutes, "#.#") + " bars. At least 6 are needed — a 2/2 pivot takes five and confirms on the fifth. Use a finer timeframe or a longer range.")
+// The range must divide evenly into chart bars, or its boundary falls mid-bar
+// and the extremes are read from a window the chart cannot represent.
+if orMinutes % timeframe.multiplier != 0
+    runtime.error("Dealing range \"" + orSess + "\" (" + str.tostring(orMinutes) + "m) must divide evenly by the chart timeframe (" + str.tostring(timeframe.multiplier) + "m), or the range boundary falls inside a bar.")
+// Tracking must begin exactly where the range ends. A later start leaves a
+// blind window in which a target, a CISD or a stop can occur unseen; an
+// earlier one drags the previous session's levels across the pre-market.
+// This is a model invariant, not a preference, so it is enforced not warned.
+if sessStartHM(trackSess) != sessEndHM(orSess)
+    runtime.error("Tracking window must start exactly when the dealing range ends. Range \"" + orSess + "\" ends " + str.tostring(sessEndHM(orSess)) + "; tracking \"" + trackSess + "\" starts " + str.tostring(sessStartHM(trackSess)) + ".")
+
+// ─── CME clock ────────────────────────────────────────────────────────────
+// A futures chart simply has no bars when CME is shut. A perp or CFD prints
+// straight through, so without this the script builds ranges across the weekend
+// and feeds them into the formation and setup statistics — the entire research
+// output.
+//
+// The windows are HELD through closed periods, not gated by them. Gating (ANDing
+// each raw window with cmeOpen) makes the daily 17:00-18:00 halt read as
+// "outside the window", so any range spanning it closes at 17:00 and re-opens at
+// 18:00 as a NEW range. Holding reproduces what a futures chart does, where
+// those bars do not exist at all.
+cmeOpenAt(int t) =>
+    int d = dayofweek(t, NYTZ)
+    int m = hour(t, NYTZ) * 60 + minute(t, NYTZ)
+    not (d == dayofweek.saturday or (d == dayofweek.sunday and m < 1080)
+         or (d == dayofweek.friday and m >= 1020) or (m >= 1020 and m < 1080))
+
+// Any futures market keeps its own exchange calendar, CME or not. Only
+// non-futures feeds are clocked, so a futures chart is bit-for-bit unchanged.
+// Futures charts keep their own exchange calendar and are never clocked. For
+// everything else the toggle decides.
+//
+// SBLR identifies clocked symbols by an explicit ticker list. This uses "not
+// futures" instead, deliberately: an explicit list that misses a ticker fails
+// SILENTLY — weekend sessions would feed the statistics with nothing on screen
+// to say so. Clocking every non-futures feed fails loudly instead, and a
+// genuine 24/7 market is one unticked box away.
+bool isFut   = syminfo.type == "futures"
+bool onClock = not isFut and cmeClockOn
+bool cmeOpen = not onClock or cmeOpenAt(time)
+
+// Engine updates run only on bars CME would have printed.
+bool barOK = barstate.isconfirmed and cmeOpen
+
+// ─── Session detection ────────────────────────────────────────────────────
+// Raw windows, before the -1 / +1 lifecycle is applied. The overlap guard has
+// to read these rather than the effective values, or a genuine misconfiguration
+// would go unreported whenever the retention window happened to suppress one.
+var bool rawOR    = false
+var bool rawTrack = false
+if cmeOpen
+    rawOR    := not na(time(timeframe.period, orSess,    NYTZ))
+    rawTrack := not na(time(timeframe.period, trackSess, NYTZ))
+if rawOR and rawTrack
+    runtime.error("Dealing range \"" + orSess + "\" and tracking window \"" + trackSess + "\" overlap. Tracking must begin where the range ends and must not run back into it.")
+
+// ─── Retained previous range (-1 / +1) ────────────────────────────────────
+// A dealing range does not stop mattering because the clock started a new one.
+// When yesterday's range is still the reference price is working inside, the
+// scheduled open would otherwise discard it mid-thesis.
+//
+// These are LATEST-CYCLE controls, not historical mode switches. last_bar_time
+// identifies the most recent scheduled range start, so enabling -1 retains one
+// range rather than shifting every past session backwards — history stays
+// exactly as it was, which is what makes the setting safe to toggle.
+// Every raw range open is recorded as it happens. If no range formed on a date
+// — weekend, holiday, half day — nothing was recorded, so nothing downstream can
+// point at it. That removes all three defects the calendar version carried: the
+// off-by-one before the open, Mondays landing on Sunday, and a window close
+// predicted from the calendar instead of observed.
+var array<int> drOpens = array.new<int>()
+if rawOR and not rawOR[1]
+    array.push(drOpens, time)
+    while array.size(drOpens) > 60
+        array.shift(drOpens)
+
+// The cycle -1 targets: the scheduled start on the chart's latest day, whether
+// or not it has happened yet. Anchoring instead on "the most recent start that
+// already happened" is what made -1 silently do nothing when set before the open.
+int drLatestStart = prevDR ? fLatestTarget(orSess, last_bar_time) : int(na)
+
+// The retained range: the last one that ACTUALLY opened before that cycle.
+int drPrevStart = na
+if prevDR and array.size(drOpens) > 0
+    for i = array.size(drOpens) - 1 to 0
+        if array.get(drOpens, i) < drLatestStart
+            drPrevStart := array.get(drOpens, i)
+            break
+
+// The window closes on the SECOND raw open at or after the targeted cycle: the
+// first is the one being skipped, the second is the proper cycle that resumes.
+// Observed, not predicted.
+int opensFromLatest = 0
+if prevDR and array.size(drOpens) > 0
+    for i = 0 to array.size(drOpens) - 1
+        if array.get(drOpens, i) >= drLatestStart
+            opensFromLatest += 1
+
+bool drWindow = prevDR and not na(drPrevStart) and time >= drPrevStart and opensFromLatest < 2
+
+// Delivery or a structural invalidation ends the retention. Before the
+// scheduled open that CANCELS it, and the new range forms normally. After the
+// open has already been skipped it STOPS the extension but does not build a
+// partial range mid-cycle — the engine waits for the next proper one.
+var bool drCanceled = false
+var bool drStopped  = false
+if not prevDR or not drWindow
+    drCanceled := false
+    drStopped  := false
+
+bool drProtect   = drWindow and not drCanceled
+bool drBasePhase = drProtect ? time < drLatestStart : false
+
+// Inside the protection window only the retained range may exist: the scheduled
+// current range is suppressed so it cannot reset the engine underneath a live
+// thesis. Tracking runs normally for the retained cycle, and +1 then holds it
+// open from the skipped start until the next proper cycle.
+bool drExtTime = drProtect ? (time >= drLatestStart and extTrack and not drStopped) : false
+inOR    = rawOR    and (not drProtect or drBasePhase)
+inTrack = (rawTrack and (not drProtect or drBasePhase)) or drExtTime
+
+// ─── Formation order at 1-minute resolution ───────────────────────────────
+// On a 2m to 5m chart both range extremes can land on one bar, which makes
+// formation order unreadable and would skip the session. The 1m series
+// separates them. Returns SCALARS only: request.security copies any returned
+// array on every chart bar and keeps it in series history, which on a coarse
+// chart over a long history walks into the runtime memory ceiling.
+f_orOrder() =>
+    var float h1 = na
+    var float l1 = na
+    var int   ht = na
+    var int   lt = na
+    // Held exactly as the chart's windows are, or the 1m series disagrees with
+    // the chart across the halt and resolves formation from a different range.
+    // Same test as the chart's, or the 1m series resolves formation from a
+    // different range across the halt. Symbol type and the input both read the
+    // same inside request.security.
+    bool open1 = not (syminfo.type != "futures" and cmeClockOn) or cmeOpenAt(time)
+    var bool in1 = false
+    if open1
+        in1 := not na(time(timeframe.period, orSess, NYTZ))
+    if in1 and not in1[1]
+        h1 := high
+        l1 := low
+        ht := time
+        lt := time
+    else if in1 and open1
+        if high > h1
+            h1 := high
+            ht := time
+        if low < l1
+            l1 := low
+            lt := time
+    [ht, lt]
+
+[orHiTime1, orLoTime1] = request.security(syminfo.tickerid, "1", f_orOrder())
+
+// ─── Types ────────────────────────────────────────────────────────────────
+// The single state-setting block. Unlike the reversal engine there is no OB
+// or PB ladder: the far end of the range is one terminal target, so one
+// level per session is all the model can express.
+type Cisd
+    float lvl              // anchor candle's open — the level
+    int   bi               // the bar whose open IS that level
+    float prot = na        // the swing extreme its V was built on
+    bool  beyond   = false // price has closed beyond the level, setup side
+    bool  touched  = false // and has closed back at/through it
+    bool  fired    = false // a retest signal is live
+    int   rtCount  = 0     // consecutive engulfing candles since firing
+    float rtBodyHi = na
+    float rtBodyLo = na
+    line  ln   = na
+    label lb   = na
+    label rtLb = na
+
+// FVG / IFVG zone. bar_time is the first candle of the three-candle pattern,
+// used with xloc.bar_time so long histories do not hit the bar_index limit.
+type Zone
+    float top
+    float bot
+    bool  isbull
+    bool  inverted = false
+    int   t1
+    box   bx  = na
+    line  ce  = na
+    label lb  = na
+
+// ─── State ────────────────────────────────────────────────────────────────
+var float orHigh   = na
+var float orLow    = na
+var int   orHiBar  = na
+var int   orLoBar  = na
+var int   orStartBar = na
+var bool  orClosed = false
+var float eqLvl    = na
+
+// formation: 1 high first, -1 low first, 2 ambiguous, 0 not resolved yet
+var int   formation = 0
+// wantDir: the direction the model will hunt. High first -> short the range
+// back to its low, low first -> long the range back to its high.
+var int   wantDir   = 0
+var float targetLvl = na
+var float bandTop   = na
+var float bandBot   = na
+
+var int   dirState    = 0      // 0 hunting, +1 bullish CISD held, -1 bearish
+var Cisd  cisd        = na
+var bool  structKill  = false
+var bool  targetHit   = false
+var bool  frozen      = false
+// A trade that fired once fired: everTriggered is permanent. tradeActive is
+// whether it is still open. The two were one flag, which let a signal be
+// un-fired on the chart while the statistics went on scoring it.
+var bool  everTriggered = false
+var bool  tradeActive   = false
+var float tradeStop     = na
+var float tradeTarget   = na
+// Was any swing structure available when the range locked? In "OR + prior
+// swing" a false here means the structure window produced no pivots, so no
+// pre-open swing could anchor anything and the mode is doing nothing.
+var bool  priorStructSeen = false
+var bool  resolvedOn1m = false   // chart bars tied; 1m broke the tie
+var int   baselineDir  = 0       // naive nearest-boundary call, +1 high / -1 low
+var bool  cisdEver     = false   // a CISD confirmed at some point this session
+// setupOutcome: 0 open, 1 target, -1 stopped at the origin extreme,
+// 2 tracking ended with the trade still open, 3 exited on the two-engulf rule,
+// 4 target and stop both touched on one bar (unresolvable from OHLC),
+// 5 exited because structure broke the protective swing.
+// 3 and 5 are kept apart on purpose: the two-engulf rule was a deliberate
+// choice, and the only way to judge it is to count how often it closed a trade
+// that a genuine structural failure would not have.
+var int   setupOutcome = 0
+
+// Swing structure
+var int swHiBar = na
+var int swLoBar = na
+
+// Pending block queues. Several swing-Vs can wait on confirmation at once;
+// a single slot silently discards a valid block before price can close
+// through it.
+var array<float> pUpLvl  = array.new<float>()
+var array<int>   pUpBar  = array.new<int>()
+var array<float> pUpProt = array.new<float>()
+var array<float> pDnLvl  = array.new<float>()
+var array<int>   pDnBar  = array.new<int>()
+var array<float> pDnProt = array.new<float>()
+
+// Drawings
+var line  eqLn      = na
+var line  orHiLn    = na
+var line  orLoLn    = na
+var box   orBox     = na
+
+// Persistent-drawing registry. Range boxes, terminated CISD levels, retest
+// arrows and target marks outlive their session by design — they are the audit
+// trail for the setup statistics. Left unbounded they accumulate until Pine
+// silently evicts the oldest at 500 objects, so how much history is on screen
+// depended on how many triggers had fired. Each object is tagged with the
+// session that created it and pruned deterministically instead.
+var int sessionSeq = 0
+var array<line>  histLn  = array.new<line>()
+var array<int>   histLnS = array.new<int>()
+var array<label> histLb  = array.new<label>()
+var array<int>   histLbS = array.new<int>()
+var array<box>   histBx  = array.new<box>()
+var array<int>   histBxS = array.new<int>()
+
+regLine(line l) =>
+    if not na(l)
+        array.push(histLn, l)
+        array.push(histLnS, sessionSeq)
+
+regLabel(label l) =>
+    if not na(l)
+        array.push(histLb, l)
+        array.push(histLbS, sessionSeq)
+
+regBox(box b) =>
+    if not na(b)
+        array.push(histBx, b)
+        array.push(histBxS, sessionSeq)
+
+// Called once per session, after the counter advances.
+pruneHist() =>
+    int cutoff = sessionSeq - histSessions
+    if array.size(histLnS) > 0
+        for i = array.size(histLnS) - 1 to 0
+            if array.get(histLnS, i) <= cutoff
+                line.delete(array.get(histLn, i))
+                array.remove(histLn, i)
+                array.remove(histLnS, i)
+    if array.size(histLbS) > 0
+        for i = array.size(histLbS) - 1 to 0
+            if array.get(histLbS, i) <= cutoff
+                label.delete(array.get(histLb, i))
+                array.remove(histLb, i)
+                array.remove(histLbS, i)
+    if array.size(histBxS) > 0
+        for i = array.size(histBxS) - 1 to 0
+            if array.get(histBxS, i) <= cutoff
+                box.delete(array.get(histBx, i))
+                array.remove(histBx, i)
+                array.remove(histBxS, i)
+var box   bandBox   = na
+var array<line>  fibLn = array.new<line>()
+var array<label> fibLb = array.new<label>()
+var array<label> fibVb = array.new<label>()
+var label eqNameLb   = na
+var label eqValLb    = na
+var label orHiNameLb = na
+var label orLoNameLb = na
+var label orHiValLb  = na
+var label orLoValLb  = na
+
+// Zones
+var array<Zone> zones = array.new<Zone>()
+
+// Historical statistics
+var int hfBreakHi = 0
+var int hfBreakLo = 0
+var int hfConsol  = 0
+var int lfBreakHi = 0
+var int lfBreakLo = 0
+var int lfConsol  = 0
+var int ambiguousTotal = 0
+var int ambiguousBreakTotal = 0
+// todayOutcome: 1 break high, -1 break low, 2 consolidation,
+// 3 ambiguous break (both sides on one bar), 0 unresolved
+var int  todayOutcome = 0
+var bool breakRecorded = false
+var int  firstSampleTime = na
+var int  lastSampleTime  = na
+
+// Setup statistics. The formation counters above answer "which side broke
+// first". These answer "did the tradeable sequence actually pay", which is a
+// different and much smaller population: formation -> CISD -> retest -> target.
+var int hfSessions = 0
+var int hfCisd     = 0
+var int hfTrig     = 0
+var int hfTrigWin  = 0
+var int hfTrigLoss = 0
+var int hfTrigNone = 0
+var int hfTrigExit = 0
+var int hfTrigStruct = 0
+var int hfTrigAmb  = 0
+var int lfSessions = 0
+var int lfCisd     = 0
+var int lfTrig     = 0
+var int lfTrigWin  = 0
+var int lfTrigLoss = 0
+var int lfTrigNone = 0
+var int lfTrigExit = 0
+var int lfTrigStruct = 0
+var int lfTrigAmb  = 0
+
+
+// Rule versus naive baseline, directional sessions only.
+var int dirTotal  = 0    // directional sessions — the rule always has a call
+var int ruleHit   = 0
+var int baseTotal = 0    // excludes ties, where the baseline has no call
+var int baseHit   = 0
+
+// Post-OR directional volume proxy
+var float postBuy  = 0.0
+var float postSell = 0.0
+var bool  postSeen = false
+
+// ─── Drawing helpers ──────────────────────────────────────────────────────
+// A confirmed CISD is evidence that the level existed. It is terminated and
+// faded at the bar it died, never deleted: a level that
+// was killed before any entry still happened, and the chart should show it.
+killCisdDraw(Cisd c) =>
+    if not na(c)
+        if not na(c.ln)
+            line.set_x2(c.ln, bar_index)
+            line.set_color(c.ln, panelMuted)
+            line.set_style(c.ln, line.style_dotted)
+            regLine(c.ln)
+            c.ln := na
+        if not na(c.lb)
+            label.set_x(c.lb, bar_index)
+            label.set_textcolor(c.lb, panelMuted)
+            regLabel(c.lb)
+            c.lb := na
+
+drawCisd(Cisd c, int d) =>
+    if cisdOn and not na(c)
+        // Right edge tracks the fib lines rather than running past them.
+        c.ln := line.new(c.bi, c.lvl, bar_index, c.lvl,
+             color = d == -1 ? cisdBearCol : cisdBullCol,
+             width = cisdWidth, style = styleOf(cisdStyle))
+        c.lb := label.new(bar_index + NAME_OFF, c.lvl, d == -1 ? "-CISD" : "+CISD",
+             color = color.new(color.white, 100),
+             textcolor = d == -1 ? cisdBearCol : cisdBullCol,
+             style = label.style_label_left, size = size.small)
+
+// Retest glyph offset: a fraction of the range, so the arrow floats clear of
+// the wick tip instead of rendering centred on the candle.
+rtOff() =>
+    float r = na(orHigh) or na(orLow) ? float(na) : orHigh - orLow
+    na(r) or r <= 0 ? syminfo.mintick * 8 : r * RT_OFF_PCT
+
+killZone(Zone z) =>
+    if not na(z)
+        if not na(z.bx)
+            box.delete(z.bx)
+            z.bx := na
+        if not na(z.ce)
+            line.delete(z.ce)
+            z.ce := na
+        if not na(z.lb)
+            label.delete(z.lb)
+            z.lb := na
+
+clearPending() =>
+    array.clear(pUpLvl)
+    array.clear(pUpBar)
+    array.clear(pUpProt)
+    array.clear(pDnLvl)
+    array.clear(pDnBar)
+    array.clear(pDnProt)
+
+// ─── Daily housekeeping ───────────────────────────────────────────────────
+// The pending queue survives the opening bell so pre-open blocks are still
+// there when the range locks, so it has to be emptied once a day instead.
+// Housekeeping runs when the TRACKING WINDOW CLOSES, not at midnight. An
+// dealing range that opens in the evening straddles the calendar boundary, so
+// a midnight clear would empty the pending queue and null both swing pointers
+// in the middle of the range being formed. The tracking close is the one
+// instant guaranteed to be outside both windows.
+if barOK and inTrack[1] and not inTrack
+    clearPending()
+    swHiBar := na
+    swLoBar := na
+    // Belt and braces: the range open also clears these, but leaving them set
+    // between sessions is what broke structure tracking in v1 to v6.
+    frozen     := false
+    targetHit  := false
+    everTriggered := false
+    tradeActive   := false
+    tradeStop     := na
+    tradeTarget   := na
+
+// ─── Dealing range: reset, track, freeze ──────────────────────────────────
+if inOR and not inOR[1]
+    orHigh   := high
+    orLow    := low
+    orHiBar  := bar_index
+    orLoBar  := bar_index
+    orStartBar := bar_index
+    orClosed := false
+    eqLvl    := na
+    formation := 0
+    wantDir   := 0
+    targetLvl := na
+    bandTop   := na
+    bandBot   := na
+    dirState  := 0
+    structKill := false
+    targetHit  := false
+    frozen     := false
+    everTriggered := false
+    tradeActive   := false
+    tradeStop     := na
+    tradeTarget   := na
+    todayOutcome  := 0
+    breakRecorded := false
+    resolvedOn1m  := false
+    baselineDir   := 0
+    cisdEver      := false
+    setupOutcome  := 0
+    postBuy  := 0.0
+    postSell := 0.0
+    postSeen := false
+    killCisdDraw(cisd)
+    cisd := na
+    // Prior structure is deliberately NOT cleared here. The swing that delivers
+    // price into the range sits immediately before the bell, and the
+    // protective-swing pruning already removes every older block the moment a
+    // higher swing high confirms — which the range high always is. A bar-count
+    // lookback on top of that was provably inert on every session tested.
+    if array.size(zones) > 0
+        for i = 0 to array.size(zones) - 1
+            killZone(array.get(zones, i))
+    array.clear(zones)
+    if array.size(fibLn) > 0
+        for i = 0 to array.size(fibLn) - 1
+            line.delete(array.get(fibLn, i))
+    array.clear(fibLn)
+    if array.size(fibLb) > 0
+        for i = 0 to array.size(fibLb) - 1
+            label.delete(array.get(fibLb, i))
+    array.clear(fibLb)
+    if array.size(fibVb) > 0
+        for i = 0 to array.size(fibVb) - 1
+            label.delete(array.get(fibVb, i))
+    array.clear(fibVb)
+    if not na(eqLn)
+        line.delete(eqLn)
+        eqLn := na
+    if not na(orHiLn)
+        line.delete(orHiLn)
+        orHiLn := na
+    if not na(orLoLn)
+        line.delete(orLoLn)
+        orLoLn := na
+    if not na(bandBox)
+        box.delete(bandBox)
+        bandBox := na
+    if not na(eqNameLb)
+        label.delete(eqNameLb)
+        eqNameLb := na
+    if not na(eqValLb)
+        label.delete(eqValLb)
+        eqValLb := na
+    if not na(orHiNameLb)
+        label.delete(orHiNameLb)
+        orHiNameLb := na
+    if not na(orLoNameLb)
+        label.delete(orLoNameLb)
+        orLoNameLb := na
+    if not na(orHiValLb)
+        label.delete(orHiValLb)
+        orHiValLb := na
+    if not na(orLoValLb)
+        label.delete(orLoValLb)
+        orLoValLb := na
+    // The dying CISD above is registered under the OUTGOING session, so the
+    // counter advances only once that is done.
+    sessionSeq += 1
+    pruneHist()
+else if inOR and cmeOpen
+    // First occurrence of each strict wick extreme. Strict comparison means a
+    // later equal high does not move orHiBar, which is what makes "formed
+    // first" well defined.
+    if high > orHigh
+        orHigh  := high
+        orHiBar := bar_index
+    if low < orLow
+        orLow   := low
+        orLoBar := bar_index
+
+// Range locks. Formation order is classified here and everything downstream
+// reads frozen values, so nothing repaints once the range locks.
+if inOR[1] and not inOR and not na(orHigh)
+    orClosed := true
+    eqLvl := (orHigh + orLow) / 2
+    priorStructSeen := not na(swHiBar) or not na(swLoBar)
+    // Naive baseline: at the lock, predict whichever boundary price is nearer.
+    // Measured alongside the formation rule so the two can be compared. If
+    // formation order were only a proxy for "price ended up nearer one side",
+    // the two would agree almost always and the rule would carry no extra
+    // information.
+    float dHi = orHigh - close[1]
+    float dLo = close[1] - orLow
+    // Exactly equidistant means the baseline genuinely has no answer. Forcing
+    // it to one side would hand the comparison an arbitrary bearish tilt, and
+    // the point of the baseline is a rigorous test, not a filled cell.
+    baselineDir := dHi < dLo ? 1 : dLo < dHi ? -1 : 0
+    firstSampleTime := na(firstSampleTime) ? time : firstSampleTime
+    lastSampleTime  := time
+
+    // Both extremes on one chart bar. Fall back to the 1m series, which can
+    // usually separate them; only give up when 1m cannot either.
+    if orHiBar == orLoBar
+        if not na(orHiTime1) and not na(orLoTime1) and orHiTime1 != orLoTime1
+            formation := orHiTime1 < orLoTime1 ? 1 : -1
+            resolvedOn1m := true
+        else
+            formation := 2
+            wantDir   := 0
+            ambiguousTotal += 1
+    else
+        formation := orHiBar < orLoBar ? 1 : -1
+    // High first -> target the low. Low first -> target the high.
+    if formation == 1
+        wantDir   := -1
+        targetLvl := orLow
+    else if formation == -1
+        wantDir   := 1
+        targetLvl := orHigh
+
+    // Fib. The extreme that formed FIRST carries 1, the later one carries 0.
+    // On an ambiguous range the orientation is undefined, so the high is used
+    // as the 1 anchor by convention and the dashboard flags it.
+    bool loFirst = formation == -1
+    float fA1 = loFirst ? orLow  : orHigh
+    float fA0 = loFirst ? orHigh : orLow
+    bandTop := math.max(fA0 + bandLoR * (fA1 - fA0), fA0 + bandHiR * (fA1 - fA0))
+    bandBot := math.min(fA0 + bandLoR * (fA1 - fA0), fA0 + bandHiR * (fA1 - fA0))
+
+    if fibOn
+        array<float> fLv = array.new<float>()
+        if fLv1On
+            array.push(fLv, fLv1)
+        if fLv2On
+            array.push(fLv, fLv2)
+        if fLv3On
+            array.push(fLv, fLv3)
+        if fLv4On
+            array.push(fLv, fLv4)
+        if fLv5On
+            array.push(fLv, fLv5)
+        if fLv6On
+            array.push(fLv, fLv6)
+        if fLv7On
+            array.push(fLv, fLv7)
+        if fLv8On
+            array.push(fLv, fLv8)
+        if array.size(fLv) > 0
+            for i = 0 to array.size(fLv) - 1
+                float r  = array.get(fLv, i)
+                float px = fA0 + r * (fA1 - fA0)
+                array.push(fibLn, line.new(bar_index, px, bar_index, px,
+                     color = fibCol, width = fibWidth, style = styleOf(fibStyle)))
+                array.push(fibLb, label.new(bar_index + NAME_OFF, px, str.tostring(r, "0.###"),
+                     color = color.new(color.white, 100), textcolor = fibCol,
+                     style = label.style_label_left, size = size.small))
+                if fibValOn
+                    array.push(fibVb, label.new(bar_index + VAL_OFF, px, fmtP(px),
+                         color = color.new(color.white, 100), textcolor = fibValCol,
+                         style = label.style_label_left, size = size.small))
+
+    if bandShow and not na(bandTop)
+        bandBox := box.new(bar_index, bandTop, bar_index, bandBot,
+             border_color = na, bgcolor = bandCol)
+    if eqOn
+        eqLn := line.new(bar_index, eqLvl, bar_index, eqLvl,
+             color = eqCol, width = eqWidth, style = styleOf(eqStyle))
+        eqNameLb := label.new(bar_index + NAME_OFF, eqLvl, "EQ",
+             color = color.new(color.white, 100), textcolor = eqCol,
+             style = label.style_label_left, size = size.small)
+    if eqValOn
+        eqValLb := label.new(bar_index + VAL_OFF, eqLvl, fmtP(eqLvl),
+             color = color.new(color.white, 100), textcolor = eqValCol,
+             style = label.style_label_left, size = size.small)
+    if orHiOn
+        orHiLn := line.new(orStartBar, orHigh, bar_index, orHigh,
+             color = orHiCol, width = orHiWidth)
+        orHiNameLb := label.new(bar_index + NAME_OFF, orHigh, orHiTxt,
+             color = color.new(color.white, 100), textcolor = orHiCol,
+             style = label.style_label_left, size = size.small)
+    if orLoOn
+        orLoLn := line.new(orStartBar, orLow, bar_index, orLow,
+             color = orLoCol, width = orLoWidth)
+        orLoNameLb := label.new(bar_index + NAME_OFF, orLow, orLoTxt,
+             color = color.new(color.white, 100), textcolor = orLoCol,
+             style = label.style_label_left, size = size.small)
+    if orValOn
+        orHiValLb := label.new(bar_index + VAL_OFF, orHigh, fmtP(orHigh),
+             color = color.new(color.white, 100), textcolor = orValCol,
+             style = label.style_label_left, size = size.small)
+        orLoValLb := label.new(bar_index + VAL_OFF, orLow, fmtP(orLow),
+             color = color.new(color.white, 100), textcolor = orValCol,
+             style = label.style_label_left, size = size.small)
+
+
+// ─── Range box ────────────────────────────────────────────────────────────
+if showOrBox
+    if inOR and not inOR[1]
+        // Registered rather than deleted: the box is part of the audit trail and
+        // is pruned with everything else by Sessions drawn.
+        orBox := box.new(bar_index, high, bar_index, low,
+             border_color = na, bgcolor = color.new(orBoxCol, BOX_TRANSP),
+             text = showBoxTxt ? "DR" : "",
+             text_color = color.new(orBoxCol, txtTransp),
+             text_size = sizeOf(boxTxtSize),
+             text_halign = text.align_center, text_valign = text.align_center)
+        regBox(orBox)
+    else if inOR and not na(orBox)
+        box.set_top(orBox, orHigh)
+        box.set_bottom(orBox, orLow)
+        box.set_right(orBox, bar_index)
+
+// ─── Target ───────────────────────────────────────────────────────────────
+// The far end of the range is the trade's target. Reaching it completes
+// delivery and the session's job is done — anything found afterwards is a
+// different idea the model was never built to express.
+//
+// This runs ahead of Confirmation so dirState is still 0 on the bar a CISD
+// confirms. That is deliberate: a session whose target was already behind
+// price at confirmation time must not terminate itself instantly.
+// Confirmed bars only, to stay in step with the statistics engine below. When
+// this ran on live ticks the dashboard could show MISSED / TARGET REACHED while
+// Session Outcome was still unresolved, which reads as a contradiction.
+if barOK and orClosed and inTrack and wantDir != 0 and not targetHit
+    // Reaching a price is a FILL, and a fill is a touch. Break measure governs
+    // the range-outcome statistic, which is a different question: did price
+    // trade BEYOND the boundary. A touch of the range low fills a target resting there
+    // and is not a break of it, and the two should not share one boolean.
+    bool hit = wantDir == 1 ? high >= orHigh : low <= orLow
+    if hit
+        targetHit := true
+        // Delivery ends the session, always. The far extreme IS the draw on
+        // liquidity; once touched the thesis has played out, and hunting a
+        // fresh CISD afterwards is a different idea. Leaving it optional also
+        // let targetHit sit true while a later trigger fired, a pair of states
+        // the dashboard cannot represent coherently.
+        frozen := true
+        // The retained thesis has played out. Before the scheduled open that
+        // releases the new range; after it, the extension simply ends.
+        if drWindow
+            if time < drLatestStart
+                drCanceled := true
+            else
+                drStopped := true
+        // Delivery is terminal, so the execution drawings stop here. An
+        // extending CISD line under a DELIVERED panel implies the level still
+        // matters to the model. The range levels and fib stay: they are
+        // context for the rest of the session.
+        if not na(cisd)
+            killCisdDraw(cisd)
+        if markTarget
+            label tgtLb = label.new(bar_index, targetLvl, "✓",
+                 style = wantDir == 1 ? label.style_label_down : label.style_label_up,
+                 color = color.new(color.gray, 60), textcolor = color.white,
+                 size = size.tiny,
+                 tooltip = "Target reached — far end of the dealing range")
+            regLabel(tgtLb)
+
+// ─── Imbalance zones ──────────────────────────────────────────────────────
+// Three-candle FVG geometry with optional volume-imbalance encompassing,
+// filtered to gaps that touch the dealing range. A violated FVG inverts into
+// an IFVG of opposite polarity; a violated IFVG is removed.
+zoneTfMs = math.round(timeframe.in_seconds() * 1000)
+
+if zoneOn and barOK and (inOR or (orClosed and inTrack)) and not frozen
+    bool bull = low > high[2] and (not requireMidClose or close[1] > high[2])
+    bool bear = high < low[2] and (not requireMidClose or close[1] < low[2])
+    float gap = bull ? low - high[2] : bear ? low[2] - high : na
+    bool sizeOK = (bull or bear) and (zoneThresh == 0.0 or (gap / close) * 100.0 >= zoneThresh)
+
+    if sizeOK
+        float bt0 = math.max(open,    close)
+        float bb0 = math.min(open,    close)
+        float bt1 = math.max(open[1], close[1])
+        float bb1 = math.min(open[1], close[1])
+        float bt2 = math.max(open[2], close[2])
+        float bb2 = math.min(open[2], close[2])
+        float zTop = na
+        float zBot = na
+        if bull
+            zTop := low
+            zBot := high[2]
+            if encompassVI
+                if bb1 > bt2
+                    zBot := bt2
+                if bb0 > bt1
+                    zTop := bb0
+        else
+            zTop := low[2]
+            zBot := high
+            if encompassVI
+                if bt1 < bb2
+                    zTop := bb2
+                if bt0 < bb1
+                    zBot := bt0
+
+        // A gap that does not touch the range is not part of this model.
+        // While the range is still forming every gap overlaps by definition.
+        bool overlaps = not orClosed or (zTop >= orLow and zBot <= orHigh)
+        if overlaps
+            Zone z = Zone.new(zTop, zBot, bull, false, time[2])
+            float mid = math.avg(zTop, zBot)
+            color zc = bull ? fvgBullCol : fvgBearCol
+            z.bx := box.new(time[2], zTop, time + zoneTfMs, zBot, xloc = xloc.bar_time,
+                 border_color = na, bgcolor = zc)
+            z.ce := line.new(time[2], mid, time + zoneTfMs, mid, xloc = xloc.bar_time,
+                 color = zoneCECol, style = line.style_dotted, width = 1)
+            if zoneLbl
+                z.lb := label.new(time + zoneTfMs, mid, bull ? zoneLblBull : zoneLblBear, xloc = xloc.bar_time,
+                     style = label.style_label_left, color = zoneLblBg,
+                     textcolor = zoneLblTxt, size = zoneSizeOf(zoneLblSize))
+            array.push(zones, z)
+            while array.size(zones) > maxZones
+                killZone(array.shift(zones))
+
+// Zone maintenance: inversion, invalidation, right-edge extension.
+if zoneOn and barOK and (inOR or inTrack) and not frozen and array.size(zones) > 0
+    for i = array.size(zones) - 1 to 0
+        Zone z = array.get(zones, i)
+        bool violated = false
+        if z.isbull
+            float src = zoneMit == "Close" ? close : low
+            violated := src < z.bot
+        else
+            float src = zoneMit == "Close" ? close : high
+            violated := src > z.top
+
+        if violated and not z.inverted
+            // FVG -> IFVG. Same coordinates, flipped polarity.
+            z.inverted := true
+            z.isbull := not z.isbull
+            killZone(z)
+            float mid = math.avg(z.top, z.bot)
+            color zc = z.isbull ? ifvgBullCol : ifvgBearCol
+            z.bx := box.new(z.t1, z.top, time + zoneTfMs, z.bot, xloc = xloc.bar_time,
+                 border_color = na, bgcolor = zc)
+            z.ce := line.new(z.t1, mid, time + zoneTfMs, mid, xloc = xloc.bar_time,
+                 color = zoneCECol, style = line.style_dotted, width = 1)
+            if zoneLbl
+                z.lb := label.new(time + zoneTfMs, mid, z.isbull ? zoneLblBullI : zoneLblBearI, xloc = xloc.bar_time,
+                     style = label.style_label_left, color = zoneLblBg,
+                     textcolor = zoneLblTxt, size = zoneSizeOf(zoneLblSize))
+        else if violated and z.inverted
+            // A violated IFVG is spent. No second flip.
+            killZone(z)
+            array.remove(zones, i)
+        else
+            if not na(z.bx)
+                box.set_right(z.bx, time + zoneTfMs)
+            if not na(z.ce)
+                line.set_x2(z.ce, time + zoneTfMs)
+            if not na(z.lb)
+                label.set_x(z.lb, time + zoneTfMs)
+
+// Live zone counts and band confluence, for the dashboard.
+int fvgLive  = 0
+int ifvgLive = 0
+// Polarity of the zones that are actually inside the band. Tracked separately
+// so the panel cannot report "IFVG IN BAND" because an FVG is in the band and
+// an unrelated IFVG exists elsewhere, and so alignment can be judged: a
+// bullish gap sitting in premium is not confluence for a short.
+bool bandBull = false
+bool bandBear = false
+bool bandBullInv = false
+bool bandBearInv = false
+if array.size(zones) > 0
+    for i = 0 to array.size(zones) - 1
+        Zone z = array.get(zones, i)
+        if z.inverted
+            ifvgLive += 1
+        else
+            fvgLive += 1
+        if not na(bandTop) and z.top >= bandBot and z.bot <= bandTop
+            if z.inverted
+                if z.isbull
+                    bandBullInv := true
+                else
+                    bandBearInv := true
+            else
+                if z.isbull
+                    bandBull := true
+                else
+                    bandBear := true
+
+// ─── Swing structure ──────────────────────────────────────────────────────
+// Pivots, left 2 / right 2. This is the only structural machinery in the
+// model. A pivot confirms two bars late, so inside a 15-bar range the first
+// usable swing lands around bar 5.
+float phNow = ta.pivothigh(high, 2, 2)
+float plNow = ta.pivotlow(low, 2, 2)
+
+// Blocks are queued from the opening bell, because the anchor must sit inside
+// the range. Confirmation is gated separately, below.
+// Swing structure is tracked on EVERY bar, with no gate at all.
+//
+// This carried the bug that made the model look broken for six versions. The
+// gate used to read `... and not frozen`, and `frozen` is only cleared at the
+// opening bell — so a session that reached its target left it set for the rest
+// of that day AND all the way through the next pre-market. No pivot was
+// registered in that window, swLoBar was still na when the opening swing high
+// confirmed two bars into the range, and the block that carries the level could
+// not be built. The first swing low of the day only landed several bars later,
+// so every block ended up anchored deep in the range and below EQ.
+//
+// Registration must never be gated on session or state. `frozen` still stops
+// confirmation and retests below, which is the only place it belongs.
+if barOK
+    // Structure as it stood BEFORE this bar's pivots. A wide-range outside bar
+    // makes both the highest high and the lowest low of its window, so
+    // ta.pivothigh and ta.pivotlow can BOTH fire on it. The low branch runs
+    // first, and if it wrote swLoBar directly the high branch would then test
+    // swLoBar < hiBar with both pointing at the same bar and refuse to build.
+    // On 07 Jul 2026 that bar was 09:30 — the bar that made the range high —
+    // so the session's defining block was silently skipped.
+    int refSwHi = swHiBar
+    int refSwLo = swLoBar
+
+    // ── a swing LOW confirms: build the pending BULLISH block ──
+    if not na(plNow)
+        // A confirmed swing low BELOW the swing the CISD's V was built on
+        // breaks the structure the level stands on. A HIGHER swing low is a
+        // higher low: bullish, and kills nothing.
+        if dirState == 1 and not na(cisd) and not na(cisd.prot) and low[2] < cisd.prot
+            structKill := true
+        // Pending blocks answer to the same test, each against its own swing.
+        if array.size(pUpProt) > 0
+            for j = array.size(pUpProt) - 1 to 0
+                if low[2] < array.get(pUpProt, j)
+                    array.remove(pUpLvl, j)
+                    array.remove(pUpBar, j)
+                    array.remove(pUpProt, j)
+        int loBar = bar_index - 2
+        // Register the pivot unconditionally. Building the block needs a
+        // preceding swing high, but registration must never depend on one —
+        // gating it deadlocks both pivots at every session reset.
+        if not na(refSwHi) and refSwHi < loBar
+            // The anchor is the last bearish candle before the swing low whose
+            // OPEN is inside the range. A candle that opened below the range
+            // is part of the excursion, not the reversal, so the walk
+            // continues past it.
+            int aBar = na
+            for b = loBar to refSwHi
+                int off = bar_index - b
+                if off >= 0 and off <= 500 and close[off] < open[off]
+                    aBar := b
+                    break
+            if not na(aBar)
+                int aOff = bar_index - aBar
+                float nLvl = open[aOff]
+                // The block extent spans the whole run, for reaction context.
+                int nLvlBar = aBar
+                // "First candle of run" moves the level to the open of the
+                // candle that STARTED the delivery, at the far end of the run.
+                // LEVEL: the anchor's own open — the LAST candle of the run,
+                // the one closest to the swing. This is the convention the
+                // Session-Based Liquidity Reversals engine uses and it is the
+                // one to keep; the "leg start" variant tried in v5 came from
+                // reading a hand-drawn line and does not reproduce a verified
+                // level.
+                array.push(pUpLvl,  nLvl)
+                array.push(pUpBar,  nLvlBar)
+                array.push(pUpProt, low[2])
+                while array.size(pUpLvl) > 12
+                    array.shift(pUpLvl)
+                    array.shift(pUpBar)
+                    array.shift(pUpProt)
+        swLoBar := loBar
+
+    // ── a swing HIGH confirms: build the pending BEARISH block ──
+    if not na(phNow)
+        if dirState == -1 and not na(cisd) and not na(cisd.prot) and high[2] > cisd.prot
+            structKill := true
+        if array.size(pDnProt) > 0
+            for j = array.size(pDnProt) - 1 to 0
+                if high[2] > array.get(pDnProt, j)
+                    array.remove(pDnLvl, j)
+                    array.remove(pDnBar, j)
+                    array.remove(pDnProt, j)
+        int hiBar = bar_index - 2
+        if not na(refSwLo) and refSwLo < hiBar
+            int aBar2 = na
+            for b = hiBar to refSwLo
+                int off3 = bar_index - b
+                if off3 >= 0 and off3 <= 500 and close[off3] > open[off3]
+                    aBar2 := b
+                    break
+            if not na(aBar2)
+                int aOff2 = bar_index - aBar2
+                float mLvl = open[aOff2]
+                int mLvlBar = aBar2
+                // LEVEL: the anchor's own open — the LAST candle of the run.
+                array.push(pDnLvl,  mLvl)
+                array.push(pDnBar,  mLvlBar)
+                array.push(pDnProt, high[2])
+                while array.size(pDnLvl) > 12
+                    array.shift(pDnLvl)
+                    array.shift(pDnBar)
+                    array.shift(pDnProt)
+        swHiBar := hiBar
+
+// ─── Confirmation ─────────────────────────────────────────────────────────
+// This is where the delivery model departs from the reversal model. There is
+// no sweep to arm the setup: the range's formation order decided the
+// direction when the range locked, and only the matching side is scanned. Confirmation
+// starts at the OR close because the direction is not known before it.
+//
+// Only one block prints per session. There is no OB or PB ladder — a single
+// terminal target cannot express a second level.
+// ONE trade attempt per range. Before an entry, a structural kill may replace
+// the CISD and hunting resumes. After an entry the model has committed: target,
+// stop, two-engulf exit or structural exit ends the thesis for the session.
+// Without `not everTriggered` a second CISD could arm and overwrite the live
+// trade's stop and target while its outcome was still open.
+if barOK and orClosed and inTrack and not frozen and dirState == 0 and wantDir != 0 and not everTriggered
+    if wantDir == 1 and array.size(pUpLvl) > 0
+        int hit = -1
+        float bestLvl = na
+        for j = 0 to array.size(pUpLvl) - 1
+            float lv = array.get(pUpLvl, j)
+            int   bb = array.get(pUpBar, j)
+            // A long's CISD may never form above EQ: that is a long taken from
+            // premium, same stop, a fraction of the range left to run.
+            float pr = array.get(pUpProt, j)
+            bool eqOK = na(eqLvl) or lv <= eqLvl
+            bool rngOK = na(orLow) or (lv >= orLow and pr >= orLow)
+            // A bullish close above the anchor's open confirms it.
+            bool ok = close > open and close > lv and bar_index > bb and eqOK and rngOK
+            // Take the LOWEST confirming level: the swing the range was
+            // delivered from, not whichever one happens to be nearest.
+            if ok and (na(bestLvl) or lv < bestLvl)
+                bestLvl := lv
+                hit := j
+        if hit != -1
+            Cisd c = Cisd.new(array.get(pUpLvl, hit), array.get(pUpBar, hit))
+            c.prot := array.get(pUpProt, hit)
+            cisd := c
+            cisdEver := true
+            dirState := 1
+            drawCisd(c, 1)
+            // Retire this block and everything older than it.
+            for j = hit to 0
+                array.remove(pUpLvl, j)
+                array.remove(pUpBar, j)
+                array.remove(pUpProt, j)
+
+    if wantDir == -1 and array.size(pDnLvl) > 0
+        int hitD = -1
+        float bestLvl2 = na
+        for j = 0 to array.size(pDnLvl) - 1
+            float lv2 = array.get(pDnLvl, j)
+            int   bb2 = array.get(pDnBar, j)
+            // A short's CISD may never form below EQ.
+            float pr2 = array.get(pDnProt, j)
+            bool eqOK2 = na(eqLvl) or lv2 >= eqLvl
+            // The block must belong to the delivery that MADE the range, not to
+            // an older, higher leg. Both the level and the swing it was built
+            // from have to sit at or below the range high. Without this,
+            // "anchor to the extreme swing" degenerates into "the highest swing
+            // anywhere in the lookback", which on a session that sold off into
+            // the open is a level from an hour earlier, far above the range.
+            bool rngOK2 = na(orHigh) or (lv2 <= orHigh and pr2 <= orHigh)
+            bool ok2 = close < open and close < lv2 and bar_index > bb2 and eqOK2 and rngOK2
+            // Take the HIGHEST confirming level.
+            if ok2 and (na(bestLvl2) or lv2 > bestLvl2)
+                bestLvl2 := lv2
+                hitD := j
+        if hitD != -1
+            Cisd c2 = Cisd.new(array.get(pDnLvl, hitD), array.get(pDnBar, hitD))
+            c2.prot := array.get(pDnProt, hitD)
+            cisd := c2
+            cisdEver := true
+            dirState := -1
+            drawCisd(c2, -1)
+            for j = hitD to 0
+                array.remove(pDnLvl, j)
+                array.remove(pDnBar, j)
+                array.remove(pDnProt, j)
+
+// ─── Pending-block diagnostic ─────────────────────────────────────────────
+// When no CISD prints there are exactly three reasons, and guessing between
+// them from the chart is hopeless. This reports which one it is: nothing was
+// ever queued on the wanted side, the best queued level is on the wrong side
+// of EQ, or a valid level is simply still waiting on a close through it.
+int   pendCount = wantDir == 1 ? array.size(pUpLvl) : wantDir == -1 ? array.size(pDnLvl) : 0
+float pendBest  = na
+if wantDir == 1 and array.size(pUpLvl) > 0
+    for j = 0 to array.size(pUpLvl) - 1
+        float lvA = array.get(pUpLvl, j)
+        if na(pendBest) or lvA < pendBest
+            pendBest := lvA
+if wantDir == -1 and array.size(pDnLvl) > 0
+    for j = 0 to array.size(pDnLvl) - 1
+        float lvB = array.get(pDnLvl, j)
+        if na(pendBest) or lvB > pendBest
+            pendBest := lvB
+bool pendEqOK = na(pendBest) or na(eqLvl) or (wantDir == -1 ? pendBest >= eqLvl : pendBest <= eqLvl)
+bool pendInRange = na(pendBest) or na(orHigh) or (wantDir == -1 ? pendBest <= orHigh : pendBest >= orLow)
+
+// ─── Trade resolution ───────────────────────────────────────────────────
+// Target versus stop, both as touches, evaluated together on the same bar.
+// Scoring them in sequence let an outside bar that touched BOTH register the
+// target first and skip the stop check entirely, so every ambiguous bar became
+// a win. OHLC cannot say which came first, so it is recorded as ambiguous and
+// excluded from the win and loss rates rather than guessed either way.
+//
+// Placed BEFORE the live setup so the entry bar is not scored: the trigger is
+// taken at that bar's close, so anything touched during it happened first.
+if barOK and orClosed and inTrack and tradeActive and setupOutcome == 0
+    bool tFill = wantDir == -1 ? low <= tradeTarget : high >= tradeTarget
+    bool sFill = wantDir == -1 ? high >= tradeStop   : low  <= tradeStop
+    if tFill or sFill
+        setupOutcome := tFill and sFill ? 4 : tFill ? 1 : -1
+        tradeActive  := false
+
+// ─── The live setup ───────────────────────────────────────────────────────
+if barOK and orClosed and dirState != 0 and not frozen and not na(cisd)
+    // Structural kill: a confirmed swing beyond the swing the CISD's V was
+    // built on. The level dies and hunting restarts in the same direction —
+    // the formation order has not changed, so the model has not changed its
+    // mind about which way to go.
+    if structKill
+        // A structural break after entry is an exit, not a reason to hunt again.
+        // The trigger arrow STAYS: it fired on a confirmed bar and a trader
+        // could have acted on it. Deleting it here left the chart disagreeing
+        // with the statistics, which still knew the trade had happened.
+        if tradeActive
+            tradeActive  := false
+            setupOutcome := 5
+            if drWindow
+                if time < drLatestStart
+                    drCanceled := true
+                else
+                    drStopped := true
+            if not na(cisd.rtLb)
+                label.set_textcolor(cisd.rtLb, panelMuted)
+            label xs = label.new(bar_index, dirState == -1 ? high + rtOff() : low - rtOff(), "×",
+                 style = label.style_none, textcolor = panelMuted, size = sizeOf(retestSize),
+                 tooltip = "Trade ended — structure broke the protective swing the level was built on")
+            regLabel(xs)
+        killCisdDraw(cisd)
+        cisd := na
+        dirState := 0
+        structKill := false
+
+    // Retest signal invalidation: two consecutive candles, each engulfing the
+    // rejection candle's BODY against the setup, void the printed signal.
+    if not na(cisd) and cisd.fired
+        bool engulf = dirState == -1 ?
+             (close > open and close >= cisd.rtBodyHi and open <= cisd.rtBodyLo) :
+             (close < open and close <= cisd.rtBodyLo and open >= cisd.rtBodyHi)
+        cisd.rtCount := engulf ? cisd.rtCount + 1 : 0
+        if cisd.rtCount >= killCloses
+            // The arrow STAYS. It fired, on a confirmed bar, and a trader
+            // could have acted on it; deleting it would leave the chart
+            // showing something no one ever saw. It is muted and an × is
+            // added at the bar the exit occurred, so replay shows the whole
+            // sequence. This rule can only fire after the entry, so it is an
+            // exit, and it is recorded as one.
+            if not na(cisd.rtLb)
+                label.set_textcolor(cisd.rtLb, panelMuted)
+            label xe = label.new(bar_index, dirState == -1 ? high + rtOff() : low - rtOff(), "×",
+                 style = label.style_none, textcolor = panelMuted, size = sizeOf(retestSize),
+                 tooltip = "Trigger invalidated — two consecutive candles engulfed the rejection body against the setup")
+            regLabel(xe)
+            cisd.fired    := false
+            cisd.touched  := false
+            cisd.rtCount  := 0
+            cisd.rtBodyHi := na
+            cisd.rtBodyLo := na
+            if tradeActive
+                tradeActive  := false
+                setupOutcome := 3
+
+    // Retest. Strictly close-based: a body close beyond the level on the
+    // setup side, then a body close back at or through it (the retrace
+    // acceptance), then a body close back through on the setup side is the
+    // trigger. Wick grazes and straight displacement never count.
+    // `not everTriggered`, not `not cisd.fired`: the two-engulf rule clears
+    // cisd.fired, which would otherwise let the same level walk back through
+    // the retest sequence and re-arm a trade whose outcome is already recorded.
+    if not na(cisd) and inTrack and not cisd.fired and not everTriggered
+        if dirState == -1
+            if cisd.beyond and not cisd.touched and close >= cisd.lvl
+                cisd.touched := true
+            if cisd.touched and close < cisd.lvl
+                cisd.fired    := true
+                everTriggered := true
+                tradeActive   := true
+                tradeStop     := wantDir == -1 ? orHigh : orLow
+                tradeTarget   := targetLvl
+                cisd.rtCount  := 0
+                cisd.rtBodyHi := math.max(open, close)
+                cisd.rtBodyLo := math.min(open, close)
+                cisd.rtLb := label.new(bar_index, high + rtOff(), "▼",
+                     style = label.style_none, textcolor = rtDnCol, size = sizeOf(retestSize))
+                regLabel(cisd.rtLb)
+            if close < cisd.lvl
+                cisd.beyond := true
+        else
+            if cisd.beyond and not cisd.touched and close <= cisd.lvl
+                cisd.touched := true
+            if cisd.touched and close > cisd.lvl
+                cisd.fired    := true
+                everTriggered := true
+                tradeActive   := true
+                tradeStop     := wantDir == -1 ? orHigh : orLow
+                tradeTarget   := targetLvl
+                cisd.rtCount  := 0
+                cisd.rtBodyHi := math.max(open, close)
+                cisd.rtBodyLo := math.min(open, close)
+                cisd.rtLb := label.new(bar_index, low - rtOff(), "▲",
+                     style = label.style_none, textcolor = rtUpCol, size = sizeOf(retestSize))
+                regLabel(cisd.rtLb)
+            if close > cisd.lvl
+                cisd.beyond := true
+
+// ─── Statistics engine ────────────────────────────────────────────────────
+// The first break outside the range records the day's directional outcome,
+// bucketed by formation order. Ambiguous ranges are counted but excluded.
+if barOK and inTrack and orClosed and formation != 2 and not breakRecorded
+    bool useWick = breakMeasure == "Wick"
+    bool brokeHi = useWick ? high > orHigh : close > orHigh
+    bool brokeLo = useWick ? low  < orLow  : close < orLow
+    if useWick and brokeHi and brokeLo
+        // One bar took both sides. Intrabar order is unknown, so the day
+        // resolves but is excluded from the sample.
+        breakRecorded := true
+        todayOutcome := 3
+        ambiguousBreakTotal += 1
+    else if brokeHi or brokeLo
+        breakRecorded := true
+        todayOutcome := brokeHi ? 1 : -1
+        if brokeHi
+            if formation == 1
+                hfBreakHi += 1
+            else
+                lfBreakHi += 1
+        else
+            if formation == 1
+                hfBreakLo += 1
+            else
+                lfBreakLo += 1
+        // Score the rule and the naive baseline on the same event.
+        dirTotal += 1
+        if wantDir == todayOutcome
+            ruleHit += 1
+        if baselineDir != 0
+            baseTotal += 1
+            if baselineDir == todayOutcome
+                baseHit += 1
+
+// Tracking window ends: an unresolved range is a consolidation.
+if barOK and inTrack[1] and not inTrack
+    if orClosed and not breakRecorded and formation != 2
+        todayOutcome := 2
+        if formation == 1
+            hfConsol += 1
+        else
+            lfConsol += 1
+    // Setup accounting. Counted at session end so every bucket moves together
+    // and today's unfinished session never inflates a denominator.
+    if orClosed and formation != 2
+        if tradeActive and setupOutcome == 0
+            setupOutcome := 2
+            tradeActive  := false
+        if formation == 1
+            hfSessions += 1
+            hfCisd     += cisdEver ? 1 : 0
+            hfTrig     += everTriggered ? 1 : 0
+            hfTrigWin  += setupOutcome ==  1 ? 1 : 0
+            hfTrigLoss += setupOutcome == -1 ? 1 : 0
+            hfTrigNone += setupOutcome ==  2 ? 1 : 0
+            hfTrigExit   += setupOutcome == 3 ? 1 : 0
+            hfTrigStruct += setupOutcome == 5 ? 1 : 0
+            hfTrigAmb  += setupOutcome ==  4 ? 1 : 0
+        else
+            lfSessions += 1
+            lfCisd     += cisdEver ? 1 : 0
+            lfTrig     += everTriggered ? 1 : 0
+            lfTrigWin  += setupOutcome ==  1 ? 1 : 0
+            lfTrigLoss += setupOutcome == -1 ? 1 : 0
+            lfTrigNone += setupOutcome ==  2 ? 1 : 0
+            lfTrigExit   += setupOutcome == 3 ? 1 : 0
+            lfTrigStruct += setupOutcome == 5 ? 1 : 0
+            lfTrigAmb  += setupOutcome ==  4 ? 1 : 0
+    orClosed := false
+
+// ─── Post-OR volume context ───────────────────────────────────────────────
+// Close-location volume model: each bar's volume is split by where the close
+// finishes inside its high-low range. A transparent directional proxy, not
+// bid/ask footprint data. Stops the moment the session resolves.
+if inTrack and orClosed and formation != 2 and todayOutcome == 0 and not breakRecorded and cmeOpen
+    if not na(volume)
+        float rng = high - low
+        float buyShare = rng > 0.0 ? (close - low) / rng : 0.5
+        buyShare := math.max(0.0, math.min(1.0, buyShare))
+        postBuy  += volume * buyShare
+        postSell += volume * (1.0 - buyShare)
+        postSeen := true
+
+// ─── Derived statistics ───────────────────────────────────────────────────
+int hfResolved = hfBreakHi + hfBreakLo + hfConsol
+int lfResolved = lfBreakHi + lfBreakLo + lfConsol
+
+float hfHiPct = hfResolved > 0 ? 100.0 * hfBreakHi / hfResolved : na
+float hfLoPct = hfResolved > 0 ? 100.0 * hfBreakLo / hfResolved : na
+float hfCoPct = hfResolved > 0 ? 100.0 * hfConsol  / hfResolved : na
+float lfHiPct = lfResolved > 0 ? 100.0 * lfBreakHi / lfResolved : na
+float lfLoPct = lfResolved > 0 ? 100.0 * lfBreakLo / lfResolved : na
+float lfCoPct = lfResolved > 0 ? 100.0 * lfConsol  / lfResolved : na
+
+// Setup statistics. "Triggered" is a share of sessions with that formation;
+// everything below it is a share of TRIGGERED sessions. Different denominators,
+// so both sample sizes are shown on the panel.
+float hfTrigPct = hfSessions > 0 ? 100.0 * hfTrig / hfSessions : na
+float lfTrigPct = lfSessions > 0 ? 100.0 * lfTrig / lfSessions : na
+// Ambiguous triggers are excluded from the DENOMINATOR, not merely from the
+// numerators. Leaving them in understates every rate: 5 wins and 3 losses out
+// of 10 triggers with 2 ambiguous is 62.5%, not 50%.
+int hfValid = hfTrig - hfTrigAmb
+int lfValid = lfTrig - lfTrigAmb
+float hfWinPct  = hfValid > 0 ? 100.0 * hfTrigWin  / hfValid : na
+float lfWinPct  = lfValid > 0 ? 100.0 * lfTrigWin  / lfValid : na
+float hfLossPct = hfValid > 0 ? 100.0 * hfTrigLoss / hfValid : na
+float lfLossPct = lfValid > 0 ? 100.0 * lfTrigLoss / lfValid : na
+float hfNonePct = hfValid > 0 ? 100.0 * hfTrigNone / hfValid : na
+float lfNonePct = lfValid > 0 ? 100.0 * lfTrigNone / lfValid : na
+float hfCisdPct = hfSessions > 0 ? 100.0 * hfCisd / hfSessions : na
+float lfCisdPct = lfSessions > 0 ? 100.0 * lfCisd / lfSessions : na
+
+// Formation rule against the naive nearest-boundary call, same events.
+float rulePct = dirTotal > 0 ? 100.0 * ruleHit / dirTotal : na
+float basePct = baseTotal > 0 ? 100.0 * baseHit / baseTotal : na
+float edgePct = na(rulePct) or na(basePct) ? na : rulePct - basePct
+
+// Most frequent historical outcome for one formation side.
+// dir: 1 break high, -1 break low, 0 consolidation, 9 no data / tie.
+histBias(float hiPct, float loPct, float coPct) =>
+    int dir = 9
+    float pct = na
+    string txt = "NO DATA"
+    if not na(hiPct) and not na(loPct) and not na(coPct)
+        float best = math.max(hiPct, math.max(loPct, coPct))
+        bool hiTop = math.abs(hiPct - best) < 0.000001
+        bool loTop = math.abs(loPct - best) < 0.000001
+        bool coTop = math.abs(coPct - best) < 0.000001
+        int ties = (hiTop ? 1 : 0) + (loTop ? 1 : 0) + (coTop ? 1 : 0)
+        if ties > 1
+            dir := 9
+            pct := best
+            txt := "NO CLEAR EDGE"
+        else if hiTop
+            dir := 1
+            pct := hiPct
+            txt := "BREAK HIGH"
+        else if loTop
+            dir := -1
+            pct := loPct
+            txt := "BREAK LOW"
+        else
+            dir := 0
+            pct := coPct
+            txt := "CONSOLIDATION"
+    [dir, pct, txt]
+
+[hfDir, hfPct, hfTxt] = histBias(hfHiPct, hfLoPct, hfCoPct)
+[lfDir, lfPct, lfTxt] = histBias(lfHiPct, lfLoPct, lfCoPct)
+
+int    histDir = formation == 1 ? hfDir : formation == -1 ? lfDir : 9
+float  histPct = formation == 1 ? hfPct : formation == -1 ? lfPct : na
+string histTxt = formation == 1 ? hfTxt : formation == -1 ? lfTxt :
+     formation == 2 ? "AMBIGUOUS RANGE" : "WAITING FOR RANGE"
+
+// The model's own call, from the formation rule alone. High first -> the low
+// is the target, so the model expects a break low.
+int    modelDir = wantDir == 1 ? 1 : wantDir == -1 ? -1 : 9
+
+// Does the historical tendency agree with the rule?
+int agreeState = 0
+string agreeTxt = "NEUTRAL"
+if (histDir == 1 or histDir == -1) and (modelDir == 1 or modelDir == -1)
+    agreeState := histDir == modelDir ? 1 : -1
+    // AGREES, not CONFIRMS. The historical figure is the MODAL outcome, which
+    // can sit well under 50%; "confirms" would overstate what is computed.
+    agreeTxt := agreeState == 1 ? "AGREES" : "DISAGREES"
+
+float postTotal = postBuy + postSell
+float postDeltaPct = postSeen and postTotal > 0.0 ? 100.0 * (postBuy - postSell) / postTotal : na
+float postAbsPct = math.abs(nz(postDeltaPct, 0.0))
+
+int    volDir = 0
+string volTxt = "WAITING"
+string strengthTxt = ""
+if not na(postDeltaPct)
+    if postAbsPct < VOL_NEUTRAL_PCT
+        volDir := 0
+        volTxt := "NEUTRAL"
+    else
+        volDir := postDeltaPct > 0.0 ? 1 : -1
+        volTxt := volDir == 1 ? "BUYING" : "SELLING"
+        strengthTxt := postAbsPct >= VOL_STRONG_PCT ? "STRONG" : postAbsPct >= VOL_MODERATE_PCT ? "MODERATE" : "WEAK"
+
+// Volume against the model's direction, not against history. The model has
+// already committed; the useful question is whether flow is going with it.
+int alignState = 0
+string alignTxt = "NEUTRAL"
+if (modelDir == 1 or modelDir == -1) and (volDir == 1 or volDir == -1)
+    alignState := modelDir == volDir ? 1 : -1
+    alignTxt := alignState == 1 ? "ALIGNED" : "CONFLICTING"
+
+// Confluence verdict. Aligned means a zone in the band delivers in the same
+// direction the model intends; a bullish gap under a short is the opposite of
+// support for the thesis, so it is named as conflicting rather than counted.
+bool bandWithDir  = wantDir == 1 ? (bandBull or bandBullInv) : wantDir == -1 ? (bandBear or bandBearInv) : false
+bool bandAgainst  = wantDir == 1 ? (bandBear or bandBearInv) : wantDir == -1 ? (bandBull or bandBullInv) : false
+// Name the zone that matters: the aligned one if there is one, else the one
+// working against the thesis.
+string bandKind = wantDir == 1 ?
+     (bandBull ? "BULL FVG" : bandBullInv ? "BULL IFVG" : bandBear ? "BEAR FVG" : bandBearInv ? "BEAR IFVG" : "") :
+     (bandBear ? "BEAR FVG" : bandBearInv ? "BEAR IFVG" : bandBull ? "BULL FVG" : bandBullInv ? "BULL IFVG" : "")
+int    bandState = bandWithDir and bandAgainst ? 2 : bandWithDir ? 1 : bandAgainst ? -1 : 0
+string bandTxt   = bandState == 2 ? "MIXED" : bandState == 0 ? (fvgLive + ifvgLive > 0 ? "OUT OF BAND" : "NONE") : bandKind
+string bandNote  = bandState == 1 ? "ALIGNED" : bandState == -1 ? "CONFLICTING" : bandState == 2 ? "BOTH POLARITIES" : ""
+
+// Setup phase, for the dashboard.
+string phaseTxt = ""
+string phaseDetail = ""
+int phaseState = 0
+if inOR
+    phaseTxt := "FORMING"
+    phaseDetail := "RANGE OPEN"
+else if formation == 2
+    phaseTxt := "NO SETUP"
+    phaseDetail := "AMBIGUOUS RANGE"
+    phaseState := -1
+else if setupOutcome == 3
+    phaseTxt := "EXITED"
+    phaseDetail := "ENGULFED"
+    phaseState := -1
+else if setupOutcome == 5
+    phaseTxt := "EXITED"
+    phaseDetail := "STRUCTURE BROKE"
+    phaseState := -1
+else if setupOutcome == 4
+    phaseTxt := "AMBIGUOUS"
+    phaseDetail := "TARGET AND STOP ONE BAR"
+    phaseState := -1
+else if setupOutcome == -1
+    phaseTxt := "STOPPED"
+    phaseDetail := "ORIGIN EXTREME BROKEN"
+    phaseState := -1
+else if targetHit
+    phaseTxt := everTriggered ? "DELIVERED" : "MISSED"
+    phaseDetail := everTriggered ? "TARGET REACHED" : "TARGET REACHED, NO ENTRY"
+    phaseState := everTriggered ? 1 : -1
+else if not na(cisd) and cisd.fired
+    phaseTxt := "TRIGGERED"
+    phaseDetail := "RETEST FIRED"
+    phaseState := 1
+else if dirState != 0
+    phaseTxt := "ARMED"
+    phaseDetail := "AWAITING RETEST"
+else if wantDir != 0
+    phaseTxt := "HUNTING"
+    phaseDetail := "NO CISD YET"
+else
+    phaseTxt := "WAITING"
+    phaseDetail := ""
+
+// ─── Extend session drawings ──────────────────────────────────────────────
+// Clocked as well: on a perp the levels would otherwise stretch across the
+// weekend, which is not what the futures chart this model was built on does.
+if barOK and inTrack and not na(orHigh)
+    if not na(eqLn)
+        line.set_x2(eqLn, bar_index)
+    if array.size(fibLn) > 0
+        for i = 0 to array.size(fibLn) - 1
+            line.set_x2(array.get(fibLn, i), bar_index)
+            label.set_x(array.get(fibLb, i), bar_index + NAME_OFF)
+    if array.size(fibVb) > 0
+        for i = 0 to array.size(fibVb) - 1
+            label.set_x(array.get(fibVb, i), bar_index + VAL_OFF)
+    if not na(orHiLn)
+        line.set_x2(orHiLn, bar_index)
+    if not na(orLoLn)
+        line.set_x2(orLoLn, bar_index)
+    if not na(bandBox)
+        box.set_right(bandBox, bar_index)
+    if not na(eqNameLb)
+        label.set_x(eqNameLb, bar_index + NAME_OFF)
+    if not na(eqValLb)
+        label.set_x(eqValLb, bar_index + VAL_OFF)
+    if not na(orHiNameLb)
+        label.set_x(orHiNameLb, bar_index + NAME_OFF)
+    if not na(orLoNameLb)
+        label.set_x(orLoNameLb, bar_index + NAME_OFF)
+    if not na(orHiValLb)
+        label.set_x(orHiValLb, bar_index + VAL_OFF)
+    if not na(orLoValLb)
+        label.set_x(orLoValLb, bar_index + VAL_OFF)
+    if not na(cisd) and not na(cisd.ln)
+        line.set_x2(cisd.ln, bar_index)
+        if not na(cisd.lb)
+            label.set_x(cisd.lb, bar_index + NAME_OFF)
+
+// ─── Dashboard ────────────────────────────────────────────────────────────
+// Two views from one table. The execution view answers four questions and
+// nothing else: what is today's thesis, is the setup valid, where is the
+// objective, does history agree. The research blocks are still calculated
+// every bar — they are only hidden, so nothing is lost by trading with them
+// off. A table that tries to be a report and a dashboard at once is neither.
+int N_DETAIL = showDetailed ? 14 : 0
+int R_RANGE  = 1                       // range-outcome block, 5 rows
+int R_SETUP  = R_RANGE + 5             // setup-outcome block, 10 rows
+int R_BASE   = R_SETUP + 8            // rule vs baseline, 1 row
+int nVol     = showVolumeRow ? 1 : 0
+int R_CTX    = 1 + N_DETAIL            // spacer above the thesis block
+int R_LAST   = R_CTX + 7 + nVol        // last row of the execution view
+int R_FOOT   = R_LAST + 1
+
+var table dash = table.new(posOf(panelPos), 3, (showDetailed ? R_FOOT : R_LAST) + 1,
+     bgcolor = panelBg, frame_color = panelBorderC, frame_width = panelBorderW,
+     border_color = panelBorderC, border_width = panelBorderW)
+
+var bool merged = false
+
+if barstate.islast and showPanel
+    txtS = sizeOf(panelSize)
+    // Coloured by what the formation IMPLIES, not by the extreme it names.
+    // High first delivers DOWN to the range low, so it wears the bearish
+    // accent; low first delivers up and wears the bullish one.
+    color hfHeadBg = formation == 1 ? color.new(sellColor, 72) : panelHeadBg
+    color lfHeadBg = formation == -1 ? color.new(buyColor, 72) : panelHeadBg
+
+    table.cell(dash, 0, 0, "INTERNAL TO EXTERNAL LIQUIDITY DELIVERY",
+         text_color = panelTxt, text_size = txtS, text_halign = text.align_center, bgcolor = panelHeadBg)
+
+    if showDetailed
+        // ── Range outcome: which side broke first ──
+        table.cell(dash, 0, R_RANGE, "RANGE OUTCOME", text_color = panelMuted, text_size = txtS, bgcolor = panelHeadBg, text_halign = text.align_left,
+             tooltip = "Which boundary broke first after the range locked, bucketed by which extreme formed first. A tendency of the RANGE, not of the trade.")
+        table.cell(dash, 1, R_RANGE, "HIGH FIRST", text_color = panelTxt, text_size = txtS, bgcolor = hfHeadBg, text_halign = text.align_center)
+        table.cell(dash, 2, R_RANGE, "LOW FIRST",  text_color = panelTxt, text_size = txtS, bgcolor = lfHeadBg, text_halign = text.align_center)
+
+        table.cell(dash, 0, R_RANGE + 1, "Break High", text_color = panelMuted, text_size = txtS, bgcolor = panelBg, text_halign = text.align_left)
+        table.cell(dash, 1, R_RANGE + 1, fmtStat(hfHiPct, hfResolved), text_color = hfDir == 1 ? buyColor : panelTxt, text_size = txtS, bgcolor = panelBg, text_halign = text.align_center)
+        table.cell(dash, 2, R_RANGE + 1, fmtStat(lfHiPct, lfResolved), text_color = lfDir == 1 ? buyColor : panelTxt, text_size = txtS, bgcolor = panelBg, text_halign = text.align_center)
+
+        table.cell(dash, 0, R_RANGE + 2, "Break Low", text_color = panelMuted, text_size = txtS, bgcolor = panelBg, text_halign = text.align_left)
+        table.cell(dash, 1, R_RANGE + 2, fmtStat(hfLoPct, hfResolved), text_color = hfDir == -1 ? sellColor : panelTxt, text_size = txtS, bgcolor = panelBg, text_halign = text.align_center)
+        table.cell(dash, 2, R_RANGE + 2, fmtStat(lfLoPct, lfResolved), text_color = lfDir == -1 ? sellColor : panelTxt, text_size = txtS, bgcolor = panelBg, text_halign = text.align_center)
+
+        table.cell(dash, 0, R_RANGE + 3, "Consolidation", text_color = panelMuted, text_size = txtS, bgcolor = panelBg, text_halign = text.align_left)
+        table.cell(dash, 1, R_RANGE + 3, fmtStat(hfCoPct, hfResolved), text_color = panelTxt, text_size = txtS, bgcolor = panelBg, text_halign = text.align_center)
+        table.cell(dash, 2, R_RANGE + 3, fmtStat(lfCoPct, lfResolved), text_color = panelTxt, text_size = txtS, bgcolor = panelBg, text_halign = text.align_center)
+
+        table.cell(dash, 0, R_RANGE + 4, "Sample", text_color = panelMuted, text_size = size.small, bgcolor = panelBg, text_halign = text.align_left)
+        table.cell(dash, 1, R_RANGE + 4, "n = " + str.tostring(hfResolved), text_color = panelMuted, text_size = size.small, bgcolor = panelBg, text_halign = text.align_center)
+        table.cell(dash, 2, R_RANGE + 4, "n = " + str.tostring(lfResolved), text_color = panelMuted, text_size = size.small, bgcolor = panelBg, text_halign = text.align_center)
+
+        // ── Setup outcome: did the tradeable sequence pay ──
+        table.cell(dash, 0, R_SETUP, "SETUP OUTCOME", text_color = panelMuted, text_size = txtS, bgcolor = panelHeadBg, text_halign = text.align_left,
+             tooltip = "The funnel: sessions -> CISD -> trigger -> outcome. CISD formed and Triggered are shares of SESSIONS; the outcome rows are shares of TRIGGERED. Ambiguous means target and stop were both touched on one bar, which OHLC cannot order, so it is excluded from the rates rather than guessed.")
+        table.cell(dash, 1, R_SETUP, "HIGH FIRST", text_color = panelTxt, text_size = txtS, bgcolor = hfHeadBg, text_halign = text.align_center)
+        table.cell(dash, 2, R_SETUP, "LOW FIRST",  text_color = panelTxt, text_size = txtS, bgcolor = lfHeadBg, text_halign = text.align_center)
+
+        table.cell(dash, 0, R_SETUP + 1, "CISD formed", text_color = panelMuted, text_size = txtS, bgcolor = panelBg, text_halign = text.align_left)
+        table.cell(dash, 1, R_SETUP + 1, fmtStat(hfCisdPct, hfSessions), text_color = panelTxt, text_size = txtS, bgcolor = panelBg, text_halign = text.align_center)
+        table.cell(dash, 2, R_SETUP + 1, fmtStat(lfCisdPct, lfSessions), text_color = panelTxt, text_size = txtS, bgcolor = panelBg, text_halign = text.align_center)
+
+        table.cell(dash, 0, R_SETUP + 2, "Triggered", text_color = panelMuted, text_size = txtS, bgcolor = panelBg, text_halign = text.align_left)
+        table.cell(dash, 1, R_SETUP + 2, fmtStat(hfTrigPct, hfSessions), text_color = panelTxt, text_size = txtS, bgcolor = panelBg, text_halign = text.align_center)
+        table.cell(dash, 2, R_SETUP + 2, fmtStat(lfTrigPct, lfSessions), text_color = panelTxt, text_size = txtS, bgcolor = panelBg, text_halign = text.align_center)
+
+        table.cell(dash, 0, R_SETUP + 3, "Target after trigger", text_color = panelMuted, text_size = txtS, bgcolor = panelBg, text_halign = text.align_left)
+        table.cell(dash, 1, R_SETUP + 3, fmtStat(hfWinPct, hfValid), text_color = alignedColor, text_size = txtS, bgcolor = panelBg, text_halign = text.align_center)
+        table.cell(dash, 2, R_SETUP + 3, fmtStat(lfWinPct, lfValid), text_color = alignedColor, text_size = txtS, bgcolor = panelBg, text_halign = text.align_center)
+
+        table.cell(dash, 0, R_SETUP + 4, "Invalidated", text_color = panelMuted, text_size = txtS, bgcolor = panelBg, text_halign = text.align_left)
+        table.cell(dash, 1, R_SETUP + 4, fmtStat(hfLossPct, hfValid), text_color = conflictColor, text_size = txtS, bgcolor = panelBg, text_halign = text.align_center)
+        table.cell(dash, 2, R_SETUP + 4, fmtStat(lfLossPct, lfValid), text_color = conflictColor, text_size = txtS, bgcolor = panelBg, text_halign = text.align_center)
+
+        table.cell(dash, 0, R_SETUP + 5, "No delivery", text_color = panelMuted, text_size = txtS, bgcolor = panelBg, text_halign = text.align_left)
+        table.cell(dash, 1, R_SETUP + 5, fmtStat(hfNonePct, hfValid), text_color = panelTxt, text_size = txtS, bgcolor = panelBg, text_halign = text.align_center)
+        table.cell(dash, 2, R_SETUP + 5, fmtStat(lfNonePct, lfValid), text_color = panelTxt, text_size = txtS, bgcolor = panelBg, text_halign = text.align_center)
+
+        table.cell(dash, 0, R_SETUP + 6, "Engulf · struct · amb", text_color = panelMuted, text_size = size.small, bgcolor = panelBg, text_halign = text.align_left,
+             tooltip = "Post-entry exits by mechanism, then ambiguous sessions. Engulf: the two-engulf rule closed the trade. Struct: structure broke the protective swing. They are separated because the two-engulf rule was a deliberate choice, and judging it means knowing how often it closed a trade that structure had not yet invalidated. Ambiguous is excluded from the win and loss rates and from their denominator.")
+        table.cell(dash, 1, R_SETUP + 6, str.tostring(hfTrigExit) + " · " + str.tostring(hfTrigStruct) + " · " + str.tostring(hfTrigAmb), text_color = panelMuted, text_size = size.small, bgcolor = panelBg, text_halign = text.align_center)
+        table.cell(dash, 2, R_SETUP + 6, str.tostring(lfTrigExit) + " · " + str.tostring(lfTrigStruct) + " · " + str.tostring(lfTrigAmb), text_color = panelMuted, text_size = size.small, bgcolor = panelBg, text_halign = text.align_center)
+
+        table.cell(dash, 0, R_SETUP + 7, "Sessions · triggered", text_color = panelMuted, text_size = size.small, bgcolor = panelBg, text_halign = text.align_left)
+        table.cell(dash, 1, R_SETUP + 7, str.tostring(hfSessions) + " · " + str.tostring(hfTrig), text_color = panelMuted, text_size = size.small, bgcolor = panelBg, text_halign = text.align_center)
+        table.cell(dash, 2, R_SETUP + 7, str.tostring(lfSessions) + " · " + str.tostring(lfTrig), text_color = panelMuted, text_size = size.small, bgcolor = panelBg, text_halign = text.align_center)
+
+        // ── Rule vs naive baseline ──
+        color edgeCol = na(edgePct) ? panelTxt : edgePct > 0 ? alignedColor : edgePct < 0 ? conflictColor : panelTxt
+        table.cell(dash, 0, R_BASE, "Rule vs baseline", text_color = panelMuted, text_size = size.small, bgcolor = panelBg, text_halign = text.align_left,
+             tooltip = "The naive baseline predicts whichever boundary price was nearest when the range locked. If formation order were only a proxy for that, the two would score the same. A lock exactly at EQ is TIED and excluded from the baseline, so the two rates can carry different denominators — the sample shown is the rule's.")
+        table.cell(dash, 1, R_BASE, baselineDir == 1 ? "NEARER HIGH" : baselineDir == -1 ? "NEARER LOW" : orClosed ? "TIED" : "-", text_color = panelMuted, text_size = size.small, bgcolor = panelBg, text_halign = text.align_center)
+        table.cell(dash, 2, R_BASE, dirTotal == 0 ? "" : dirTotal < MIN_SAMPLE ? "n=" + str.tostring(dirTotal) :
+             fmtPct(rulePct) + " vs " + fmtPct(basePct) + " · " + (edgePct >= 0 ? "+" : "") + str.tostring(edgePct, "#.0"),
+             text_color = edgeCol, text_size = size.small, bgcolor = panelBg, text_halign = text.align_center)
+
+    // ── Today: the execution view ──
+    // Two groups separated by a blank row: the thesis (what the model expects
+    // and whether history agrees), then the execution (is it valid, where, and
+    // does structure support it). Nothing else belongs on a live panel.
+    table.cell(dash, 0, R_CTX, "", text_color = panelMuted, text_size = size.tiny, bgcolor = panelBg)
+
+    string formTxt = formation == 1 ? "HIGH FIRST" : formation == -1 ? "LOW FIRST" :
+         formation == 2 ? "AMBIGUOUS" : inOR ? "FORMING" : "WAITING"
+    // Coloured by what the formation IMPLIES, not the extreme it names.
+    color formCol = formation == 1 ? sellColor : formation == -1 ? buyColor : panelTxt
+    table.cell(dash, 0, R_CTX + 1, "Formation", text_color = panelMuted, text_size = txtS, bgcolor = panelBg, text_halign = text.align_left,
+         tooltip = "Which range extreme printed first — the premise the whole model rests on. When both land on one chart bar the 1-minute series separates them.")
+    table.cell(dash, 1, R_CTX + 1, formTxt, text_color = formCol, text_size = txtS, bgcolor = panelBg, text_halign = text.align_center)
+    table.cell(dash, 2, R_CTX + 1, resolvedOn1m ? "1m resolved" : "", text_color = panelMuted, text_size = size.small, bgcolor = panelBg, text_halign = text.align_center)
+
+    color modelCol = modelDir == 1 ? buyColor : modelDir == -1 ? sellColor : panelTxt
+    string deliverTxt = modelDir == 1 ? "DR HIGH" : modelDir == -1 ? "DR LOW" : "NO SETUP"
+    table.cell(dash, 0, R_CTX + 2, "Delivery", text_color = panelMuted, text_size = txtS, bgcolor = panelBg, text_halign = text.align_left,
+         tooltip = "Where the model expects price to be drawn. High first delivers to the range low; low first to the range high. A touch completes it and ends the session.")
+    table.cell(dash, 1, R_CTX + 2, deliverTxt, text_color = modelCol, text_size = txtS, bgcolor = panelBg, text_halign = text.align_center)
+    table.cell(dash, 2, R_CTX + 2, na(targetLvl) ? "" : fmtP(targetLvl), text_color = modelCol, text_size = txtS, bgcolor = panelBg, text_halign = text.align_center)
+
+    color agreeCol = agreeState == 1 ? alignedColor : agreeState == -1 ? conflictColor : panelTxt
+    int histN = formation == 1 ? hfResolved : formation == -1 ? lfResolved : 0
+    // Percentage and denominator together, always. A rate without its sample
+    // size is the easiest number on a dashboard to over-trust.
+    string histNote = na(histPct) ? "" : fmtPct(histPct) + " · n=" + str.tostring(histN) +
+         (agreeState == 0 ? "" : " · " + agreeTxt)
+    table.cell(dash, 0, R_CTX + 3, "Historical", text_color = panelMuted, text_size = txtS, bgcolor = panelBg, text_halign = text.align_left,
+         tooltip = "The MODAL outcome for today's formation in this chart's own sample, its share, and the sample size. A modal share can sit well under half, so AGREES means it points the same way as the model — not that it confirms it.")
+    table.cell(dash, 1, R_CTX + 3, histTxt, text_color = panelTxt, text_size = txtS, bgcolor = panelBg, text_halign = text.align_center)
+    table.cell(dash, 2, R_CTX + 3, histNote, text_color = agreeCol, text_size = size.small, bgcolor = panelBg, text_halign = text.align_center)
+
+    table.cell(dash, 0, R_CTX + 4, "", text_color = panelMuted, text_size = size.tiny, bgcolor = panelBg)
+
+    color phaseCol = phaseState == 1 ? alignedColor : phaseState == -1 ? conflictColor : panelTxt
+    table.cell(dash, 0, R_CTX + 5, "Setup", text_color = panelMuted, text_size = txtS, bgcolor = panelBg, text_halign = text.align_left,
+         tooltip = "WAITING, FORMING, HUNTING, ARMED, TRIGGERED, then EXITED / STOPPED / AMBIGUOUS / DELIVERED / MISSED. One trade attempt per formation.")
+    table.cell(dash, 1, R_CTX + 5, phaseTxt, text_color = phaseCol, text_size = txtS, bgcolor = panelBg, text_halign = text.align_center)
+    table.cell(dash, 2, R_CTX + 5, phaseDetail, text_color = panelMuted, text_size = size.small, bgcolor = panelBg, text_halign = text.align_center)
+
+    string cisdVal = not na(cisd) ? fmtP(cisd.lvl) : pendCount == 0 ? "none" : fmtP(pendBest)
+    bool cisdInBand = not na(cisd) and not na(bandTop) and cisd.lvl >= bandBot and cisd.lvl <= bandTop
+    string eqSide = na(cisd) or na(eqLvl) ? "" : cisd.lvl >= eqLvl ? "PREMIUM" : "DISCOUNT"
+    string cisdNote = not na(cisd) ? eqSide + (cisdInBand ? " · IN BAND" : "") : wantDir == 0 ? "" : pendCount == 0 ? "NO PENDING BLOCKS" : not pendInRange ? "BEST OUTSIDE RANGE" : not pendEqOK ? "BEST BLOCKED BY EQ" : "AWAITING CLOSE THROUGH"
+    color cisdNoteCol = not na(cisd) ? (cisdInBand ? alignedColor : panelMuted) : pendCount == 0 or not pendEqOK or not pendInRange ? conflictColor : panelMuted
+    table.cell(dash, 0, R_CTX + 6, "CISD", text_color = panelMuted, text_size = txtS, bgcolor = panelBg, text_halign = text.align_left,
+         tooltip = "The anchor candle's open — the structural execution level. PREMIUM / DISCOUNT is its side of EQ; IN BAND means it also sits inside the retracement band.")
+    table.cell(dash, 1, R_CTX + 6, cisdVal, text_color = dirState == 1 ? buyColor : dirState == -1 ? sellColor : panelTxt, text_size = txtS, bgcolor = panelBg, text_halign = text.align_center)
+    table.cell(dash, 2, R_CTX + 6, cisdNote, text_color = cisdNoteCol, text_size = size.small, bgcolor = panelBg, text_halign = text.align_center)
+
+    color bandCol = bandState == 1 ? alignedColor : bandState == -1 ? conflictColor : panelTxt
+    table.cell(dash, 0, R_CTX + 7, "Confluence", text_color = panelMuted, text_size = txtS, bgcolor = panelBg, text_halign = text.align_left,
+         tooltip = "The imbalance zone inside the retracement band, and whether its polarity delivers in the direction the model intends. Confluence only — it never gates the signal.")
+    table.cell(dash, 1, R_CTX + 7, bandTxt, text_color = bandCol, text_size = txtS, bgcolor = panelBg, text_halign = text.align_center)
+    table.cell(dash, 2, R_CTX + 7, bandNote, text_color = bandCol, text_size = size.small, bgcolor = panelBg, text_halign = text.align_center)
+
+    // Off by default: a close-location proxy that gates nothing does not earn
+    // a line on a live execution panel.
+    if showVolumeRow
+        color volCol = volDir == 1 ? buyColor : volDir == -1 ? sellColor : panelTxt
+        color alignCol = alignState == 1 ? alignedColor : alignState == -1 ? conflictColor : panelTxt
+        table.cell(dash, 0, R_CTX + 8, "Volume", text_color = panelMuted, text_size = size.small, bgcolor = panelBg, text_halign = text.align_left,
+             tooltip = "Close-location volume proxy, not order flow, and untested. Context only — it never affects the signal.")
+        table.cell(dash, 1, R_CTX + 8, volTxt + (strengthTxt == "" ? "" : " · " + strengthTxt), text_color = volCol, text_size = size.small, bgcolor = panelBg, text_halign = text.align_center)
+        table.cell(dash, 2, R_CTX + 8, alignState == 0 ? "" : alignTxt, text_color = alignCol, text_size = size.small, bgcolor = panelBg, text_halign = text.align_center)
+
+    if showDetailed
+        string dateRange = na(firstSampleTime) ? "no samples" :
+             str.format_time(firstSampleTime, "MM/dd/yy", NYTZ) + "–" + str.format_time(lastSampleTime, "MM/dd/yy", NYTZ)
+        string structWarn = orClosed and not priorStructSeen ? "⚠ no prior structure · " : ""
+        string footer = structWarn +
+             str.tostring(orMinutes) + "m OR · " + (breakMeasure == "Wick" ? "by wick" : "by close") + " · TF " + tfLabel() +
+             " · ET · " + dateRange +
+             (ambiguousTotal > 0 ? " · " + str.tostring(ambiguousTotal) + " ambig" : "") +
+             (ambiguousBreakTotal > 0 ? " · " + str.tostring(ambiguousBreakTotal) + " amb.brk" : "") +
+             (frozen ? " · FROZEN" : "")
+        table.cell(dash, 0, R_FOOT, footer, text_color = panelMuted, text_size = size.tiny, text_halign = text.align_center, bgcolor = panelBg)
+
+    // Merges run last: a cell must exist before it can be merged.
+    if not merged
+        table.merge_cells(dash, 0, 0, 2, 0)
+        table.merge_cells(dash, 0, R_CTX, 2, R_CTX)
+        table.merge_cells(dash, 0, R_CTX + 4, 2, R_CTX + 4)
+        if showDetailed
+            table.merge_cells(dash, 0, R_FOOT, 2, R_FOOT)
+        merged := true
