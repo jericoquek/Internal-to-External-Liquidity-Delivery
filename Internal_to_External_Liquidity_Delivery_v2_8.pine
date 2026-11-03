@@ -42,6 +42,60 @@
 //   confirm= a later close beyond the level, in the target direction
 // Pivots are 2/2. No ATR, no point thresholds, no leg windows.
 //
+// v2.9.1
+//   Runs on 1m to 4H, up from 1m to 15m.
+//   On 1H and 4H a window is read by CANDLE OPEN TIME — a candle belongs to the
+//   range only if it OPENS inside it — so the window has to sit on candle
+//   boundaries or it loses the candle it starts in.
+//   The daily schedule cannot be satisfied at 4H at all: six candles is the
+//   floor a 2/2 pivot needs, six 4H candles is 24 hours, and a 24-hour range
+//   leaves nothing for tracking. 4H therefore works only with a dated range.
+//   1H is fine on the schedule — 1800-0800 is 14 candles.
+//   The dated range now answers the same six-candle floor, measured from its
+//   timestamps. It had been skipping it along with the session-string rules,
+//   which would have let a three-candle dated range run and find no swings.
+//   The 1m formation tie-break scales with the chart: 1m up to 15m, 5m at 1H,
+//   15m at 4H. A 1m request from a 4H chart asks for 240 intrabars per candle
+//   and blows TradingView's intrabar ceiling before it answers anything. The
+//   coarser the resolver, the more often two extremes on one candle cannot be
+//   separated — those sessions report AMBIGUOUS rather than being guessed.
+//
+// v2.9  port review from Session-Based Liquidity Reversals v7.22
+//   1. The CME clock now reaches the STRUCTURE, not just the engine schedule.
+//      v2.8 gated WHEN the engine ran but left it reading raw bars, so on a
+//      clocked perp a swing or a gap next to the halt or the weekend was judged
+//      against candles the futures contract never printed — which defeats the
+//      point of the clock. Swings read the last five CME-valid candles via
+//      ta.valuewhen, the FVG triple steps back over closed candles, and both
+//      anchor walks skip them. On futures cmeOpen is always true, so every one
+//      of these collapses to the plain offset it replaced and the chart is
+//      bit-for-bit unchanged.
+//      Writing the swing comparison out also settles the tie question that was
+//      left open: a swing must now be STRICTLY higher (lower) than all four
+//      neighbours. ta.pivothigh handled exact ties differently, and there is no
+//      way to express the clock-aware form without choosing. THIS CAN MOVE A
+//      LEVEL on a session with a tied high or low — replay 12 Aug and 07 Jul.
+//   2. Dated range replaces -1 / +1, which are gone from the settings and the
+//      code along with fStartOnDate and fLatestTarget. A range pinned by date
+//      and time can run any length and across weekends, and it has no cycle
+//      arithmetic to get wrong — the four defects -1 produced (off-by-one
+//      before the open, Mondays landing on Sunday, a predicted window close,
+//      midnight-crossing ranges targeting the wrong cycle) cannot exist in it.
+//      It starts on the first CME-valid candle at or after From, so a From
+//      inside the halt still begins on a candle that exists. While it is on,
+//      the daily schedule is off and the session-string guards are skipped:
+//      there is no HHMM window to parse, no length to divide, nothing to align.
+//      The 1m formation tie-break honours it too.
+//   3. EQ defaults to dotted, matching the fib.
+//   Settings moved and inputs were removed: RESET SETTINGS TO DEFAULTS.
+//
+//   Not ported from v7.22: the entry model (two-path FVG/MSS entry, re-entry
+//   after a stop, stacked-gap merge, trade bracket, RR calculator) assumes
+//   SBLR's thesis, where the gap carries the trade; here zones are confluence
+//   and entry is a close-based CISD retest. Nor the two-close FVG violation —
+//   single-close mitigation IS the FVG/IFVG inversion in this model. Nor 4H
+//   support — that is now in (see v2.9.1).
+//
 // v2.8  port review from Session-Based Liquidity Reversals v7.10
 //   1. -1 now targets the cycle IN PROGRESS on a midnight-crossing range. The
 //      default range is 1800-0800, so -1 set at 03:00 was targeting tonight's
@@ -494,19 +548,34 @@ cmeClockOn = input.bool(true, "Hold perpetual futures to the CME clock", group =
 
 // ─── Dealing range ────────────────────────────────────────────────────────
 grpOR = "Dealing range"
-orSess    = input.session("1800-0800", "Dealing range (ET)", group = grpOR, inline = "dr",
+orSess    = input.session("1800-0800", "Dealing range (ET)", group = grpOR,
      tooltip = "The dealing range. Any window may be used; the model reads its length rather than assuming one. High and low are wick extremes and DST is handled automatically. Changing this resets the accumulated statistics, because a 30-minute sample and a 15-minute sample are different populations.")
-prevDR    = input.bool(false, "-1", group = grpOR, inline = "dr",
-     tooltip = "Keep the PREVIOUS dealing range live instead of starting the scheduled current one. Use it when yesterday's range is still the reference price is working inside and today's open would otherwise discard it. This is a latest-cycle control, not a historical mode: enabling it does not shift every past session backwards. Delivery or a structural invalidation before the scheduled open cancels it and the new range forms normally.")
-trackSess = input.session("0800-1700", "Tracking window (ET)", group = grpOR, inline = "tw",
+trackSess = input.session("0800-1700", "Tracking window (ET)", group = grpOR,
      tooltip = "Where the setup is hunted and the target is measured. It must START WHEN THE OPENING RANGE ENDS. Starting it earlier does not extend the CISD search backwards and it drags the previous session's levels across the pre-market.")
-extTrack  = input.bool(false, "+1", group = grpOR, inline = "tw",
-     tooltip = "With -1 enabled, carry the retained range's tracking window through one additional cycle, so it can still deliver after the scheduled open has passed. Delivery or a structural invalidation stops the extension; the skipped range is not rebuilt mid-cycle. Ignored unless -1 is on.")
 breakMeasure = input.string("Wick", "Break measure", options = ["Close", "Wick"], group = grpOR,
      tooltip = "How a break of a range extreme is confirmed for the RANGE OUTCOME statistic: did price trade beyond the boundary. Close = a bar must close beyond it. Wick = any trade beyond it counts. Target and stop fills are separate and always inclusive touches, because reaching a price is not the same question as breaking a level.")
 markTarget = input.bool(true, "Mark the target bar", group = grpOR)
 histSessions = input.int(1, "Sessions drawn", minval = 1, maxval = 100, group = grpOR,
      tooltip = "How many sessions of range boxes, CISD levels, retest arrows and target marks stay on the chart. 1 shows today only. Raise it when auditing the research panel against the chart, then put it back. This affects drawing only — the statistics accumulate over all loaded history either way.")
+
+// ─── Dated range ──────────────────────────────────────────────────────────
+// The daily times repeat every day, so they cannot describe a range that runs
+// past 24 hours or across a weekend. This pins one by date and time instead.
+//
+// It replaces the -1 / +1 controls, which tried to express the same idea
+// through cycle arithmetic and produced four separate defects doing it: the
+// off-by-one before the open, Mondays landing on Sunday, a window close
+// predicted rather than observed, and midnight-crossing ranges targeting the
+// wrong cycle. A range fixed by date has no cycle to compute, so none of those
+// failure modes exist.
+grpDt = "Dated range"
+datedOn    = input.bool(false, "Dated range", group = grpDt,
+     tooltip = "A dealing range fixed by date and time instead of the daily schedule. It can run any length and across days. Tracking opens at To and closes at Tracking to. From its start the daily schedule is off; untick to go back to it.\n\nThe pickers follow TradingView's date convention, which may not be New York time: after setting From, check that the range box starts on the candle you meant.")
+datedStart = input.time(timestamp("2026-10-12T18:00:00-04:00"), "From", group = grpDt, active = datedOn)
+datedEnd   = input.time(timestamp("2026-10-13T08:00:00-04:00"), "To", group = grpDt, active = datedOn)
+datedTrkTo = input.time(timestamp("2026-10-13T17:00:00-04:00"), "Tracking to", group = grpDt, active = datedOn)
+if datedOn and (datedEnd <= datedStart or datedTrkTo <= datedEnd)
+    runtime.error("Dated range: To must be after From, and Tracking to must be after To.")
 
 // ─── Levels ───────────────────────────────────────────────────────────────
 // Range structure and execution structure are different classes of object, so
@@ -530,7 +599,7 @@ orValCol = input.color(color.new(#424351, 50), "", group = grpL, inline = "lv")
 
 eqOn    = input.bool(true, "EQ", group = grpL, inline = "eq")
 eqCol   = input.color(color.new(#424351, 50), "", group = grpL, inline = "eq")
-eqStyle = input.string("Dashed", "", options = ["Solid", "Dotted", "Dashed"], group = grpL, inline = "eq")
+eqStyle = input.string("Dotted", "", options = ["Solid", "Dotted", "Dashed"], group = grpL, inline = "eq")
 eqWidth = input.int(1, "Width", minval = 1, maxval = 5, group = grpL, inline = "eq")
 
 eqValOn  = input.bool(true, "Show EQ value", group = grpL, inline = "ev")
@@ -728,31 +797,19 @@ sessMinutes(string sess) =>
     float raw = (eH * 60 + eM) - (sH * 60 + sM)
     na(raw) ? int(na) : int(raw <= 0 ? raw + 1440 : raw)
 
-// Absolute session-start timestamp on the calendar day of refTime.
-fStartOnDate(string sess, int refTime) =>
-    timestamp(NYTZ, year(refTime, NYTZ), month(refTime, NYTZ), dayofmonth(refTime, NYTZ),
-         sessStartHM(sess) / 100, sessStartHM(sess) % 100)
-
-// The cycle -1 targets. A window that crosses midnight belongs to the day it
-// STARTED: between midnight and its end, the cycle in progress opened the
-// previous evening. Without this, -1 set at 03:00 on the default 1800-0800
-// range targets tonight's 18:00 open and leaves the range actually in progress
-// to be discarded — the exact thing it exists to prevent.
-fLatestTarget(string sess, int refTime) =>
-    int st  = sessStartHM(sess) / 100 * 60 + sessStartHM(sess) % 100
-    int en  = sessEndHM(sess)   / 100 * 60 + sessEndHM(sess)   % 100
-    int now = hour(refTime, NYTZ) * 60 + minute(refTime, NYTZ)
-    int t   = fStartOnDate(sess, refTime)
-    if en <= st and now < en
-        t := fStartOnDate(sess, refTime - 86400000)
-    t
-
 tfLabel() =>
     timeframe.isseconds ? str.tostring(timeframe.multiplier) + "s" :
+     timeframe.isminutes and timeframe.multiplier >= 60 and timeframe.multiplier % 60 == 0 ?
+     str.tostring(timeframe.multiplier / 60) + "H" :
      timeframe.isminutes ? str.tostring(timeframe.multiplier) + "min" :
      timeframe.isdaily ? "1D" : timeframe.period
 
 // ─── Guard ────────────────────────────────────────────────────────────────
+// The session-string rules below describe the DAILY schedule and are skipped
+// when a dated range is on: a range pinned by date has no HHMM window to parse,
+// no length to divide by the bar size, and nothing to align against. The
+// chart-level guards — standard candles and the timeframe band — always apply.
+//
 // Minute charts, 1 to 5. The range must also hold enough bars to host a swing:
 // a 2/2 pivot needs five bars and confirms on the fifth, so below six bars the
 // range cannot produce a single confirmed swing of its own and the model would
@@ -770,7 +827,7 @@ float tfMinutes = timeframe.in_seconds() / 60.0
 // binding saved settings positionally: inputs removed in an earlier version
 // can leave a stored value attached to whichever field now sits in that slot.
 // Resetting the indicator's settings to defaults clears it.
-if na(orMinutes)
+if not datedOn and na(orMinutes)
     runtime.error("Could not read the dealing range window: \"" + orSess + "\". Expected HHMM-HHMM. Reset the indicator settings to defaults.")
 // A range may run up to, but not including, 24 hours. Session arithmetic wraps
 // into 1..1440, so a range that spans the whole day leaves nothing for tracking
@@ -786,34 +843,45 @@ if na(orMinutes)
 // The pattern is worth keeping in mind: a bound invented to catch a mistake
 // keeps catching normal use when the mistake and the normal case are not
 // actually separated by the quantity being measured.
-if orMinutes >= 1440
+if not datedOn and orMinutes >= 1440
     runtime.error("Dealing range \"" + orSess + "\" spans the full 24 hours, leaving nothing for the tracking window. Check the start and end are the right way round.")
-if na(sessStartHM(trackSess)) or na(sessEndHM(trackSess))
+if not datedOn and (na(sessStartHM(trackSess)) or na(sessEndHM(trackSess)))
     runtime.error("Could not read the tracking window: \"" + trackSess + "\". Expected HHMM-HHMM.")
-// Minute charts, 1m to 15m. Seconds and daily-or-higher cannot resolve an
-// dealing range at all; above 15m the CISD becomes the open of a very coarse
-// candle and the trigger a close of the same size, which is a different
-// instrument from the one this model was tested on rather than a finer or
-// blunter view of it. The bar-count and divisibility rules below still do the
-// real filtering — this is an outer bound, not the primary gate.
+// The bar-count and divisibility rules below do the real filtering; the
+// timeframe bound is only an outer edge. Be aware that above roughly 15m the
+// CISD is the open of a coarse candle and the trigger a close of the same size:
+// still the model, but a blunter instrument than the one it was verified on.
 // Every level this script draws is a candle open. On Heikin Ashi, Renko or any
 // other synthetic series those opens are computed rather than traded, so every
 // CISD would sit at a price nobody transacted at.
 if not chart.is_standard
     runtime.error("Use standard candles. Heikin Ashi, Renko and other synthetic charts move the levels this indicator draws.")
-if not timeframe.isminutes or timeframe.multiplier > 15
-    runtime.error("Internal to External Liquidity Delivery runs on 1m to 15m charts only. Seconds, daily and higher timeframes cannot resolve a dealing range.")
-if orMinutes / tfMinutes < 6
-    runtime.error("Dealing range too short for this timeframe: \"" + orSess + "\" is " + str.tostring(orMinutes) + "m, which on a " + str.tostring(timeframe.multiplier) + "m chart is " + str.tostring(orMinutes / tfMinutes, "#.#") + " bars. At least 6 are needed — a 2/2 pivot takes five and confirms on the fifth. Use a finer timeframe or a longer range.")
+// 1m to 4H. Above 4H a range cannot hold enough candles to host a swing at
+// all. Seconds and daily-or-higher cannot resolve a dealing range.
+//
+// On 1H and 4H a window is read by CANDLE OPEN TIME: a candle belongs to the
+// range only if it OPENS inside it. Put the window on candle boundaries, or it
+// loses the candle it starts in.
+if not timeframe.isminutes or timeframe.in_seconds() > 14400
+    runtime.error("Internal to External Liquidity Delivery runs on 1m to 4H charts only. Seconds, daily and higher timeframes cannot resolve a dealing range.")
+// A dated range skips the session-string rules, but not this one: six candles
+// is what a 2/2 pivot needs, whatever defines the window. Measured from the
+// timestamps, so a range spanning a weekend holds fewer candles than this
+// counts — it is an upper bound, not an exact one.
+float datedMinutes = datedOn ? (datedEnd - datedStart) / 60000.0 : float(na)
+if datedOn and datedMinutes / tfMinutes < 6
+    runtime.error("Dated range too short for this timeframe: " + str.tostring(datedMinutes, "#") + "m on a " + tfLabel() + " chart is " + str.tostring(datedMinutes / tfMinutes, "#.#") + " candles. At least 6 are needed — a 2/2 pivot takes five and confirms on the fifth. Use a finer timeframe or a longer range.")
+if not datedOn and orMinutes / tfMinutes < 6
+    runtime.error("Dealing range too short for this timeframe: \"" + orSess + "\" is " + str.tostring(orMinutes) + "m, which on a " + tfLabel() + " chart is " + str.tostring(orMinutes / tfMinutes, "#.#") + " bars. At least 6 are needed — a 2/2 pivot takes five and confirms on the fifth. Use a finer timeframe or a longer range.")
 // The range must divide evenly into chart bars, or its boundary falls mid-bar
 // and the extremes are read from a window the chart cannot represent.
-if orMinutes % timeframe.multiplier != 0
-    runtime.error("Dealing range \"" + orSess + "\" (" + str.tostring(orMinutes) + "m) must divide evenly by the chart timeframe (" + str.tostring(timeframe.multiplier) + "m), or the range boundary falls inside a bar.")
+if not datedOn and orMinutes % timeframe.multiplier != 0
+    runtime.error("Dealing range \"" + orSess + "\" (" + str.tostring(orMinutes) + "m) must divide evenly by the chart timeframe (" + tfLabel() + "), or the range boundary falls inside a bar.")
 // Tracking must begin exactly where the range ends. A later start leaves a
 // blind window in which a target, a CISD or a stop can occur unseen; an
 // earlier one drags the previous session's levels across the pre-market.
 // This is a model invariant, not a preference, so it is enforced not warned.
-if sessStartHM(trackSess) != sessEndHM(orSess)
+if not datedOn and sessStartHM(trackSess) != sessEndHM(orSess)
     runtime.error("Tracking window must start exactly when the dealing range ends. Range \"" + orSess + "\" ends " + str.tostring(sessEndHM(orSess)) + "; tracking \"" + trackSess + "\" starts " + str.tostring(sessStartHM(trackSess)) + ".")
 
 // ─── CME clock ────────────────────────────────────────────────────────────
@@ -850,6 +918,26 @@ bool cmeOpen = not onClock or cmeOpenAt(time)
 // Engine updates run only on bars CME would have printed.
 bool barOK = barstate.isconfirmed and cmeOpen
 
+// ─── CME-valid candle sequence ────────────────────────────────────────────
+// Gating WHEN the engine runs is not enough: it must also read only the
+// candles a futures chart would have printed. On a futures chart bar[2] from
+// Monday's open IS Friday's last bar, because no weekend bars exist. On a
+// clocked perp bar[2] is a Sunday bar the contract never printed, so the same
+// swing or gap resolves differently on the two charts — which defeats the
+// point of the clock. Everything below steps over closed-hours candles.
+// Without the clock every candle is valid and these reduce to plain offsets.
+//
+// Offsets of the two valid candles before the current one (1 and 2 normally).
+validBack2() =>
+    int b = 1
+    while b <= 500 and not cmeOpen[b]
+        b += 1
+    int c = b + 1
+    while c <= 500 and not cmeOpen[c]
+        c += 1
+    [b, c]
+
+
 // ─── Session detection ────────────────────────────────────────────────────
 // Raw windows, before the -1 / +1 lifecycle is applied. The overlap guard has
 // to read these rather than the effective values, or a genuine misconfiguration
@@ -859,73 +947,22 @@ var bool rawTrack = false
 if cmeOpen
     rawOR    := not na(time(timeframe.period, orSess,    NYTZ))
     rawTrack := not na(time(timeframe.period, trackSess, NYTZ))
-if rawOR and rawTrack
+if not datedOn and rawOR and rawTrack
     runtime.error("Dealing range \"" + orSess + "\" and tracking window \"" + trackSess + "\" overlap. Tracking must begin where the range ends and must not run back into it.")
 
-// ─── Retained previous range (-1 / +1) ────────────────────────────────────
-// A dealing range does not stop mattering because the clock started a new one.
-// When yesterday's range is still the reference price is working inside, the
-// scheduled open would otherwise discard it mid-thesis.
-//
-// These are LATEST-CYCLE controls, not historical mode switches. last_bar_time
-// identifies the most recent scheduled range start, so enabling -1 retains one
-// range rather than shifting every past session backwards — history stays
-// exactly as it was, which is what makes the setting safe to toggle.
-// Every raw range open is recorded as it happens. If no range formed on a date
-// — weekend, holiday, half day — nothing was recorded, so nothing downstream can
-// point at it. That removes all three defects the calendar version carried: the
-// off-by-one before the open, Mondays landing on Sunday, and a window close
-// predicted from the calendar instead of observed.
-var array<int> drOpens = array.new<int>()
-if rawOR and not rawOR[1]
-    array.push(drOpens, time)
-    while array.size(drOpens) > 60
-        array.shift(drOpens)
+// ─── Effective windows ────────────────────────────────────────────────────
+// A dated range replaces the schedule entirely from its start: range until To,
+// tracking until Tracking to, then idle. It begins on the first CME-valid
+// candle at or after From, so a From inside the halt or the weekend still
+// starts on a candle that exists.
+var bool datedLive = false
+bool datedFirst = false
+if datedOn and cmeOpen and not datedLive and time >= datedStart
+    datedLive  := true
+    datedFirst := true
 
-// The cycle -1 targets: the scheduled start on the chart's latest day, whether
-// or not it has happened yet. Anchoring instead on "the most recent start that
-// already happened" is what made -1 silently do nothing when set before the open.
-int drLatestStart = prevDR ? fLatestTarget(orSess, last_bar_time) : int(na)
-
-// The retained range: the last one that ACTUALLY opened before that cycle.
-int drPrevStart = na
-if prevDR and array.size(drOpens) > 0
-    for i = array.size(drOpens) - 1 to 0
-        if array.get(drOpens, i) < drLatestStart
-            drPrevStart := array.get(drOpens, i)
-            break
-
-// The window closes on the SECOND raw open at or after the targeted cycle: the
-// first is the one being skipped, the second is the proper cycle that resumes.
-// Observed, not predicted.
-int opensFromLatest = 0
-if prevDR and array.size(drOpens) > 0
-    for i = 0 to array.size(drOpens) - 1
-        if array.get(drOpens, i) >= drLatestStart
-            opensFromLatest += 1
-
-bool drWindow = prevDR and not na(drPrevStart) and time >= drPrevStart and opensFromLatest < 2
-
-// Delivery or a structural invalidation ends the retention. Before the
-// scheduled open that CANCELS it, and the new range forms normally. After the
-// open has already been skipped it STOPS the extension but does not build a
-// partial range mid-cycle — the engine waits for the next proper one.
-var bool drCanceled = false
-var bool drStopped  = false
-if not prevDR or not drWindow
-    drCanceled := false
-    drStopped  := false
-
-bool drProtect   = drWindow and not drCanceled
-bool drBasePhase = drProtect ? time < drLatestStart : false
-
-// Inside the protection window only the retained range may exist: the scheduled
-// current range is suppressed so it cannot reset the engine underneath a live
-// thesis. Tracking runs normally for the retained cycle, and +1 then holds it
-// open from the skipped start until the next proper cycle.
-bool drExtTime = drProtect ? (time >= drLatestStart and extTrack and not drStopped) : false
-inOR    = rawOR    and (not drProtect or drBasePhase)
-inTrack = (rawTrack and (not drProtect or drBasePhase)) or drExtTime
+inOR    = datedOn ? (datedLive and time < datedEnd) : rawOR
+inTrack = datedOn ? (datedLive and time >= datedEnd and time < datedTrkTo) : rawTrack
 
 // ─── Formation order at 1-minute resolution ───────────────────────────────
 // On a 2m to 5m chart both range extremes can land on one bar, which makes
@@ -940,13 +977,13 @@ f_orOrder() =>
     var int   lt = na
     // Held exactly as the chart's windows are, or the 1m series disagrees with
     // the chart across the halt and resolves formation from a different range.
-    // Same test as the chart's, or the 1m series resolves formation from a
-    // different range across the halt. Symbol type and the input both read the
-    // same inside request.security.
+    // Symbol type and the inputs all read the same inside request.security, so
+    // the dated range is honoured here too — otherwise the tie-break would
+    // resolve formation from the daily schedule's window instead.
     bool open1 = not (syminfo.type != "futures" and cmeClockOn) or cmeOpenAt(time)
     var bool in1 = false
     if open1
-        in1 := not na(time(timeframe.period, orSess, NYTZ))
+        in1 := datedOn ? (time >= datedStart and time < datedEnd) : not na(time(timeframe.period, orSess, NYTZ))
     if in1 and not in1[1]
         h1 := high
         l1 := low
@@ -961,7 +998,14 @@ f_orOrder() =>
             lt := time
     [ht, lt]
 
-[orHiTime1, orLoTime1] = request.security(syminfo.tickerid, "1", f_orOrder())
+// The tie-break resolution SCALES with the chart. A 1m request from a 4H chart
+// asks for 240 intrabars per candle, which blows TradingView's intrabar ceiling
+// long before it answers anything. Keeping the ratio near 15:1 stays inside it.
+// The coarser the resolver, the more often it cannot separate two extremes that
+// landed on one candle, and the session is then reported AMBIGUOUS rather than
+// guessed.
+string resTf = timeframe.in_seconds() <= 900 ? "1" : timeframe.in_seconds() <= 3600 ? "5" : "15"
+[orHiTime1, orLoTime1] = request.security(syminfo.tickerid, resTf, f_orOrder())
 
 // ─── Types ────────────────────────────────────────────────────────────────
 // The single state-setting block. Unlike the reversal engine there is no OB
@@ -1250,7 +1294,7 @@ if barOK and inTrack[1] and not inTrack
     tradeTarget   := na
 
 // ─── Dealing range: reset, track, freeze ──────────────────────────────────
-if inOR and not inOR[1]
+if (inOR and not inOR[1]) or (datedFirst and inOR)
     orHigh   := high
     orLow    := low
     orHiBar  := bar_index
@@ -1505,13 +1549,6 @@ if barOK and orClosed and inTrack and wantDir != 0 and not targetHit
         // let targetHit sit true while a later trigger fired, a pair of states
         // the dashboard cannot represent coherently.
         frozen := true
-        // The retained thesis has played out. Before the scheduled open that
-        // releases the new range; after it, the extension simply ends.
-        if drWindow
-            if time < drLatestStart
-                drCanceled := true
-            else
-                drStopped := true
         // Delivery is terminal, so the execution drawings stop here. An
         // extending CISD line under a DELIVERED panel implies the level still
         // matters to the model. The range levels and fib stay: they are
@@ -1533,30 +1570,33 @@ if barOK and orClosed and inTrack and wantDir != 0 and not targetHit
 zoneTfMs = math.round(timeframe.in_seconds() * 1000)
 
 if zoneOn and barOK and (inOR or (orClosed and inTrack)) and not frozen
-    bool bull = low > high[2] and (not requireMidClose or close[1] > high[2])
-    bool bear = high < low[2] and (not requireMidClose or close[1] < low[2])
-    float gap = bull ? low - high[2] : bear ? low[2] - high : na
+    // The three candles are this one and the two valid candles before it.
+    [oB, oC] = validBack2()
+    bool triple = oC <= 500
+    bool bull = triple and low > high[oC] and (not requireMidClose or close[oB] > high[oC])
+    bool bear = triple and high < low[oC] and (not requireMidClose or close[oB] < low[oC])
+    float gap = bull ? low - high[oC] : bear ? low[oC] - high : na
     bool sizeOK = (bull or bear) and (zoneThresh == 0.0 or (gap / close) * 100.0 >= zoneThresh)
 
     if sizeOK
         float bt0 = math.max(open,    close)
         float bb0 = math.min(open,    close)
-        float bt1 = math.max(open[1], close[1])
-        float bb1 = math.min(open[1], close[1])
-        float bt2 = math.max(open[2], close[2])
-        float bb2 = math.min(open[2], close[2])
+        float bt1 = math.max(open[oB], close[oB])
+        float bb1 = math.min(open[oB], close[oB])
+        float bt2 = math.max(open[oC], close[oC])
+        float bb2 = math.min(open[oC], close[oC])
         float zTop = na
         float zBot = na
         if bull
             zTop := low
-            zBot := high[2]
+            zBot := high[oC]
             if encompassVI
                 if bb1 > bt2
                     zBot := bt2
                 if bb0 > bt1
                     zTop := bb0
         else
-            zTop := low[2]
+            zTop := low[oC]
             zBot := high
             if encompassVI
                 if bt1 < bb2
@@ -1568,12 +1608,12 @@ if zoneOn and barOK and (inOR or (orClosed and inTrack)) and not frozen
         // While the range is still forming every gap overlaps by definition.
         bool overlaps = not orClosed or (zTop >= orLow and zBot <= orHigh)
         if overlaps
-            Zone z = Zone.new(zTop, zBot, bull, false, time[2])
+            Zone z = Zone.new(zTop, zBot, bull, false, time[oC])
             float mid = math.avg(zTop, zBot)
             color zc = bull ? fvgBullCol : fvgBearCol
-            z.bx := box.new(time[2], zTop, time + zoneTfMs, zBot, xloc = xloc.bar_time,
+            z.bx := box.new(time[oC], zTop, time + zoneTfMs, zBot, xloc = xloc.bar_time,
                  border_color = na, bgcolor = zc)
-            z.ce := line.new(time[2], mid, time + zoneTfMs, mid, xloc = xloc.bar_time,
+            z.ce := line.new(time[oC], mid, time + zoneTfMs, mid, xloc = xloc.bar_time,
                  color = zoneCECol, style = line.style_dotted, width = 1)
             if zoneLbl
                 z.lb := label.new(time + zoneTfMs, mid, bull ? zoneLblBull : zoneLblBear, xloc = xloc.bar_time,
@@ -1656,8 +1696,30 @@ if array.size(zones) > 0
 // Pivots, left 2 / right 2. This is the only structural machinery in the
 // model. A pivot confirms two bars late, so inside a 15-bar range the first
 // usable swing lands around bar 5.
-float phNow = ta.pivothigh(high, 2, 2)
-float plNow = ta.pivotlow(low, 2, 2)
+//
+// The five candles are the last five CME-VALID ones, not the last five bars.
+// ta.pivothigh reads the raw series, so on a clocked perp a swing next to the
+// halt or the weekend was being judged against candles the futures contract
+// never printed. Everywhere else these are simply the last five bars.
+//
+// Writing the comparison out also settles the tie question: a swing must be
+// STRICTLY higher (lower) than all four neighbours. ta.pivothigh was doing
+// something else on an exact tie, and there is no way to express the
+// clock-aware version without choosing. SBLR made the same choice after a
+// 30,914 / 30,914 tie produced a block nobody would have marked.
+float vH0 = ta.valuewhen(cmeOpen, high, 0)
+float vH1 = ta.valuewhen(cmeOpen, high, 1)
+float vH2 = ta.valuewhen(cmeOpen, high, 2)
+float vH3 = ta.valuewhen(cmeOpen, high, 3)
+float vH4 = ta.valuewhen(cmeOpen, high, 4)
+float vL0 = ta.valuewhen(cmeOpen, low, 0)
+float vL1 = ta.valuewhen(cmeOpen, low, 1)
+float vL2 = ta.valuewhen(cmeOpen, low, 2)
+float vL3 = ta.valuewhen(cmeOpen, low, 3)
+float vL4 = ta.valuewhen(cmeOpen, low, 4)
+int   vB2 = ta.valuewhen(cmeOpen, bar_index, 2)   // the pivot candle
+float phNow = vH2 > vH3 and vH2 > vH4 and vH2 > vH1 and vH2 > vH0 ? vH2 : float(na)
+float plNow = vL2 < vL3 and vL2 < vL4 and vL2 < vL1 and vL2 < vL0 ? vL2 : float(na)
 
 // Blocks are queued from the opening bell, because the anchor must sit inside
 // the range. Confirmation is gated separately, below.
@@ -1690,16 +1752,16 @@ if barOK
         // A confirmed swing low BELOW the swing the CISD's V was built on
         // breaks the structure the level stands on. A HIGHER swing low is a
         // higher low: bullish, and kills nothing.
-        if dirState == 1 and not na(cisd) and not na(cisd.prot) and low[2] < cisd.prot
+        if dirState == 1 and not na(cisd) and not na(cisd.prot) and plNow < cisd.prot
             structKill := true
         // Pending blocks answer to the same test, each against its own swing.
         if array.size(pUpProt) > 0
             for j = array.size(pUpProt) - 1 to 0
-                if low[2] < array.get(pUpProt, j)
+                if plNow < array.get(pUpProt, j)
                     array.remove(pUpLvl, j)
                     array.remove(pUpBar, j)
                     array.remove(pUpProt, j)
-        int loBar = bar_index - 2
+        int loBar = vB2
         // Register the pivot unconditionally. Building the block needs a
         // preceding swing high, but registration must never depend on one —
         // gating it deadlocks both pivots at every session reset.
@@ -1711,7 +1773,7 @@ if barOK
             int aBar = na
             for b = loBar to refSwHi
                 int off = bar_index - b
-                if off >= 0 and off <= 500 and close[off] < open[off]
+                if off >= 0 and off <= 500 and cmeOpen[off] and close[off] < open[off]
                     aBar := b
                     break
             if not na(aBar)
@@ -1729,7 +1791,7 @@ if barOK
                 // level.
                 array.push(pUpLvl,  nLvl)
                 array.push(pUpBar,  nLvlBar)
-                array.push(pUpProt, low[2])
+                array.push(pUpProt, plNow)
                 while array.size(pUpLvl) > 12
                     array.shift(pUpLvl)
                     array.shift(pUpBar)
@@ -1738,20 +1800,20 @@ if barOK
 
     // ── a swing HIGH confirms: build the pending BEARISH block ──
     if not na(phNow)
-        if dirState == -1 and not na(cisd) and not na(cisd.prot) and high[2] > cisd.prot
+        if dirState == -1 and not na(cisd) and not na(cisd.prot) and phNow > cisd.prot
             structKill := true
         if array.size(pDnProt) > 0
             for j = array.size(pDnProt) - 1 to 0
-                if high[2] > array.get(pDnProt, j)
+                if phNow > array.get(pDnProt, j)
                     array.remove(pDnLvl, j)
                     array.remove(pDnBar, j)
                     array.remove(pDnProt, j)
-        int hiBar = bar_index - 2
+        int hiBar = vB2
         if not na(refSwLo) and refSwLo < hiBar
             int aBar2 = na
             for b = hiBar to refSwLo
                 int off3 = bar_index - b
-                if off3 >= 0 and off3 <= 500 and close[off3] > open[off3]
+                if off3 >= 0 and off3 <= 500 and cmeOpen[off3] and close[off3] > open[off3]
                     aBar2 := b
                     break
             if not na(aBar2)
@@ -1761,7 +1823,7 @@ if barOK
                 // LEVEL: the anchor's own open — the LAST candle of the run.
                 array.push(pDnLvl,  mLvl)
                 array.push(pDnBar,  mLvlBar)
-                array.push(pDnProt, high[2])
+                array.push(pDnProt, phNow)
                 while array.size(pDnLvl) > 12
                     array.shift(pDnLvl)
                     array.shift(pDnBar)
@@ -1896,11 +1958,6 @@ if barOK and orClosed and dirState != 0 and not frozen and not na(cisd)
         if tradeActive
             tradeActive  := false
             setupOutcome := 5
-            if drWindow
-                if time < drLatestStart
-                    drCanceled := true
-                else
-                    drStopped := true
             if not na(cisd.rtLb)
                 label.set_textcolor(cisd.rtLb, panelMuted)
             label xs = label.new(bar_index, dirState == -1 ? high + rtOff() : low - rtOff(), "×",
