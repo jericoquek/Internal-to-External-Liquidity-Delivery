@@ -1,4 +1,4 @@
-[README (1).md](https://github.com/user-attachments/files/33056621/README.1.md)
+[README (1).md](https://github.com/user-attachments/files/34303554/README.1.md)
 # Internal to External Liquidity Delivery
 
 A TradingView indicator for delivery from internal range liquidity to external
@@ -41,8 +41,9 @@ Nothing has to break.
 
 ## Structural detection
 
-Swing pivots are 2 left / 2 right. No ATR bands, no point thresholds, no
-leg-length windows anywhere in the detection.
+Swing pivots are 2 left / 2 right, and a swing must be **strictly** higher
+(lower) than all four neighbours — a tie is not a swing. No ATR bands, no point
+thresholds, no leg-length windows anywhere in the detection.
 
 For a short setup:
 
@@ -121,19 +122,30 @@ not begun.
 - **Standard candles only.** Every level here is a candle open. On Heikin Ashi,
   Renko or any other synthetic series those opens are computed rather than
   traded, so every CISD would sit at a price nobody transacted at.
-- **Timeframe:** 1m to 15m. Above that the CISD is the open of a very coarse
-  candle and the trigger a close of the same size, which is a different
-  proposition rather than a coarser view of the same one.
-- **Bar count:** the range must contain at least 6 bars. A 2/2 pivot needs five
+- **Timeframe:** 1m to 4H. Above roughly 15m the CISD is the open of a coarse
+  candle and the trigger a close of the same size — still the model, but a
+  blunter instrument than the one it was verified on.
+- **Bar count:** the range must contain at least 6 candles, dated ranges
+  included. A 2/2 pivot needs five
   bars and confirms on the fifth, so below six the range cannot host a swing of
   its own.
 - **Divisibility:** the range length must divide evenly by the chart timeframe,
   or its boundary falls mid-bar.
 - **Alignment:** the tracking window must start exactly when the range ends, and
-  the two must not overlap. Checked against the raw windows, so a
+  the two must not overlap. This and the other session-string rules are skipped
+  while a dated range is on. Checked against the raw windows, so a
   misconfiguration is still caught while a range is being retained.
 - **Length:** the range may not span a full 24 hours — that leaves nothing for
   the tracking window.
+
+**On 1H and 4H a window is read by candle open time.** A candle belongs to the
+range only if it *opens* inside it, so put the window on candle boundaries or it
+loses the candle it starts in.
+
+**4H works only with a dated range.** Six candles is the floor a 2/2 pivot
+needs; six 4H candles is 24 hours; and a 24-hour range leaves nothing for
+tracking. The daily schedule therefore cannot be satisfied at 4H by any window.
+1H is fine on the schedule — `1800-0800` is 14 candles.
 
 All are enforced with `runtime.error`, not warned about. A late tracking start
 would leave a blind window in which a target or stop could occur unseen.
@@ -143,8 +155,12 @@ would leave a blind window in which a target or stop could occur unseen.
 tracking window closes rather than at midnight, so it can never fall inside a
 range that straddles the date boundary.
 
-When both extremes land on one chart bar, formation order is resolved from the
-1-minute series before the session is given up as ambiguous.
+When both extremes land on one chart candle, formation order is resolved from a
+finer series before the session is given up as ambiguous. That series scales
+with the chart — 1m up to 15m, 5m at 1H, 15m at 4H — because a 1m request from a
+4H chart asks for 240 intrabars per candle and exceeds TradingView's intrabar
+ceiling. The coarser the resolver, the more often two extremes on one candle
+cannot be separated, and those sessions report `AMBIGUOUS` rather than guessed.
 
 ---
 
@@ -166,6 +182,16 @@ distinction matters: ANDing each window with a market-open flag makes the daily
 halt read as *outside the window*, so any range spanning it closes at 17:00 and
 reopens at 18:00 as a new range. Holding reproduces what a futures chart does,
 where those bars do not exist at all.
+
+The clock reaches the **structure**, not just the schedule. Gating when the
+engine runs is not enough: it must also read only the candles a futures chart
+would have printed. On a futures chart, bar `[2]` from Monday's open *is*
+Friday's last bar, because no weekend bars exist; on a clocked perp it is a
+Sunday bar the contract never printed, so the same swing or gap resolves
+differently on the two charts. Swings read the last five CME-valid candles, the
+FVG triple steps back over closed candles, and both anchor walks skip them. On
+futures `cmeOpen` is always true, so every one of those collapses to the plain
+offset it replaced.
 
 The test is the symbol type, so it covers any non-futures feed, not only
 perpetuals. That is deliberate: an explicit ticker list that misses a symbol
@@ -279,8 +305,11 @@ Market  →  Dealing Range  →  Execution  →  Imbalance Confluence
 first thing to check, and a weekend session quietly feeding the statistics is
 the costliest thing here to get wrong.
 
-**Dealing range** — range window with `-1`, tracking window with `+1`, break
-measure, mark target bar, sessions drawn.
+**Dealing range** — range window, tracking window, break measure, mark target
+bar, sessions drawn.
+
+**Dated range** — a range pinned by date and time, with its own tracking end.
+Off by default; while it is on the daily schedule is off.
 
 **Dealing range levels** — DR high, DR low, show values, EQ, show EQ value.
 Where the range is.
@@ -345,9 +374,9 @@ research view for testing whether it contributes anything.
   session — that is a range-source feature this does not yet have. Everything
   downstream is already source-agnostic: it reads two extremes and which came
   first, and nothing else.
-- **`-1` retains exactly one cycle.** If a range needs to hold for several days,
-  the clock is the wrong tool for it — a range that survives that long is being
-  held by structure, which is the range-source point above.
+- **Bar scans reach back 500 candles.** A tracking window running more than 500
+  candles past the range stops finding structure. For a multi-day dated range,
+  use a coarser timeframe.
 - **Sample size.** A 1m chart holds roughly two weeks of futures history. Split
   by formation and then by trigger, the setup statistics land in single digits.
   A 5m chart holds roughly ten times that and is where the numbers start to mean
@@ -382,8 +411,9 @@ Same structural machinery, opposite trigger, and merging them would have put a
 mode switch through a script that is already trusted.
 
 The forked regions are marked in the header with their source line ranges. The
-`-1` / `+1` lifecycle and the CME clock both came across from that script; the
-spread buffer did too, and was then dropped from both.
+The CME clock came across from that script, as did the dated range that
+replaced the `-1` / `+1` lifecycle; the spread buffer did too, and was then
+dropped from both.
 
 Not everything crosses, and the exceptions are worth knowing before porting a
 change either way:
@@ -435,7 +465,7 @@ ever becomes selectable.
 
 | File | Purpose |
 |---|---|
-| `Internal_to_External_Liquidity_Delivery_v2_8.pine` | The indicator |
+| `Internal_to_External_Liquidity_Delivery_v2_9_1.pine` | The indicator |
 | `README.md` | This document |
 
 The script header carries a full changelog, newest first. Versions through v27
